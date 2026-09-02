@@ -1,0 +1,7 @@
+# test artifacts — never commit
+big10m.txt
+nonl.txt
+test_combos.txt
+results*/
+*.out
+__pycache__/
