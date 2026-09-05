@@ -1,0 +1,26 @@
+{
+  "_comment": [
+    "Find these ONCE via MITM (your own device/app), then fill in.",
+    "endpoint   = the authenticated account/summary JSON the app hits",
+    "build_id   = the current shakti build id Netflix wants (rotate when 401s)",
+    "api_key    = optional header key",
+    "region/plan/status_path = dot-notation JSON pointer into that response",
+    "logged_in_probes = if ANY of these keys exists non-null, account is authed"
+  ],
+  "endpoint": "https://www.netflix.com/api/shakti/multi/accountMenu",
+  "build_id": "",
+  "api_key": "",
+  "referer": "https://www.netflix.com/",
+  "origin": "https://www.netflix.com",
+  "timeout": 15,
+  "logged_in_probes": ["model.summary.membershipStatus", "loggedIn"],
+  "region_path": "model.summary.userCountry",
+  "region_path_alt": "userCountry",
+  "plan_path": "model.summary.subPlan",
+  "plan_path_alt": "subPlan",
+  "status_path": "model.summary.membershipStatus",
+  "status_path_alt": "membershipStatus",
+  "login_endpoint": "https://www.netflix.com/api/shakti/multi/authcontext/login",
+  "login_field": "userLoginId",
+  "pass_field": "password"
+}

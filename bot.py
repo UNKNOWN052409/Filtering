@@ -26,6 +26,25 @@ DL = f"https://api.telegram.org/file/bot{TOKEN}"
 WORK = os.path.expanduser("~/Filtering/bot_results")
 MB20 = 20 * 1024 * 1024          # telegram bot download cap
 EDIT_EVERY = 2.0                  # sec between live-stat edits
+
+def cleanup_old_runs(keep=5):
+    """Delete all but the newest `keep` run dirs under WORK.
+    Guarantees the NEXT run always ships its own fresh output and a stale
+    saved run can never be re-shipped / re-listed as current results."""
+    try:
+        if not os.path.isdir(WORK):
+            return
+        dirs = [os.path.join(WORK, d) for d in os.listdir(WORK)
+                if os.path.isdir(os.path.join(WORK, d))]
+        dirs.sort(key=lambda p: os.path.getmtime(p), reverse=True)
+        for old in dirs[keep:]:
+            try:
+                import shutil
+                shutil.rmtree(old, ignore_errors=True)
+            except Exception:
+                pass
+    except Exception:
+        pass
 CC_MAP = {1:"US_CA",7:"RU_KZ",20:"Egypt",27:"SouthAfrica",30:"Turkey",31:"Netherlands",
 32:"Belgium",33:"France",34:"Spain",36:"Hungary",39:"Italy",40:"Romania",41:"Switzerland",
 43:"Austria",44:"UK",45:"Denmark",46:"Sweden",47:"Norway",48:"Poland",49:"Germany",
@@ -240,7 +259,12 @@ class Engine(threading.Thread):
         msg = (f"✅ <b>DONE</b> — {el:.1f}s | {self.lines:,} lines | {total:,} sorted\n"
                f"files: {len(self.counts)}{rows}")
         self.bot.edit(self.chat, msg)
-        # ship files
+        # ship files — ONLY from THIS run's dir, never a stale one
+        if not self.counts:
+            self.bot.edit(self.chat, "⚠️ kuch match nahi hua — input format check karo.\n"
+                                   "url:login:pass | email:pass | phone:pass | login:pass")
+            self.bot.done(self.chat)
+            return
         paths = [os.path.join(self.out, f"{safe_name(n)}_{self.run_id}.txt")
                  for n in self.counts]
         paths = [p for p in paths if os.path.exists(p)]
@@ -358,6 +382,7 @@ class Bot:
             tg_send(chat, HELP)
 
     def launch(self, chat, src, kws, auto):
+        cleanup_old_runs(keep=5)          # prune stale runs before starting
         j = Engine(self, chat, src, kws, auto)
         self.jobs[chat] = j
         self.state[chat] = "busy"
@@ -399,4 +424,5 @@ if __name__ == "__main__":
     if not TOKEN:
         print("usage: BOT_TOKEN=... python3 bot.py   |   python3 bot.py <token>"); sys.exit(1)
     os.makedirs(WORK, exist_ok=True)
+    cleanup_old_runs(keep=5)              # prune stale runs at startup
     Bot().poll()

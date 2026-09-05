@@ -3,5 +3,6 @@ big10m.txt
 nonl.txt
 test_combos.txt
 results*/
+checker/out/
 *.out
 __pycache__/
