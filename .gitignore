@@ -6,3 +6,5 @@ results*/
 checker/out/
 *.out
 __pycache__/
+bot.log
+*.log
