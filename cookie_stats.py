@@ -43,20 +43,26 @@ VERSION = "1.1"
 AUTHOR = "@torbug"
 CHUNK_SIZE = 8 * 1024 * 1024
 
-# ---- paid-plan keyword hints (substring match, case-insensitive) ----
-PLAN_HINTS = [
-    b"premium", b"prime", b"ultimate", b"family", b"max", b"plus",
-    b"yearly", b"annual", b"quarterly", b"monthly", b"cancel",
-    b"ads-free", b"adfree", b"gift",
-]
-# ---- cookie name keystore (shortest interesting names, domain-agnostic) ----
-COOKIE_NAMES = [
-    b"netflixid", b"sessionid", b"session", b"auth", b"token", b"at",
-    b"rt", b"amzn_uid", b"sid", b"csid", b"kl", b"li_at", b"datr",
-    b"secure_session", b"connect.sid", b"PHPSESSID", b"JSESSIONID",
-    b"_sp_id", b"c_user", b"xs", b"TS", b"sb", b"ds_user_id",
-    b"g_session_id", b"cf_clearance", b"__Secure-", b"__Host-",
-]
+# ---- paid-plan keyword hints ----
+# matched against cookie VALUE tokens only (after stripping Domain=/Path=/HttpOnly
+# attributes and the domain itself), so 'primevideo.com' Domain= does NOT
+# count as a 'prime' plan hint.
+PLAN_RE = re.compile(
+    rb"(?<![a-z0-9])(premium|ultimate|family|yearly|annual|quarterly|monthly|"
+    rb"ads[-_]?free|gift|plus|max|prime)(?![a-z0-9])")
+
+# ---- cookie key regexes (word-boundary match, not substring) ----
+# ONE combined alternation = one regex pass per line (22 separate searches
+# made 1M-line runs ~10x slower). Longer keys listed first so alternation
+# picks the exact name (sessionid before session etc.).
+# 'at' is deliberately OMITTED — it appears inside netflixid/c_data/etc and
+# is not a useful standalone key; 'rt', 'kl', 'TS', 'sb' were removed for the
+# same reason (too short, too many false positives).
+COOKIE_KEY_RE = re.compile(
+    rb"(?<![a-z0-9])(sessionid|secure_session|netflixid|connect\.sid|PHPSESSID|"
+    rb"JSESSIONID|_sp_id|g_session_id|ds_user_id|cf_clearance|amzn_uid|c_user|"
+    rb"li_at|datr|session|auth|token|csid|sid|xs)(?![a-z0-9])|__Secure-|__Host-",
+    re.I)
 
 EMAIL_RE = re.compile(rb"^[^@\s]+@[^@\s]+\.[a-z]{2,}$", re.I)
 DOMAIN_RE = re.compile(rb"^[a-z0-9][a-z0-9.\-]*\.[a-z]{2,}$", re.I)
@@ -125,16 +131,29 @@ def cookie_domain_hint(raw):
 def classify_raw(raw):
     """-> (kind, payload, domain) where kind is cookie|creds|url|other.
     cookie  : key=value pairs (netflixid=...; session=...)
-    creds   : email:pass or login:pass
+    creds   : email:pass / login:pass / url:login:pass / url | login:pass
     url     : http(s) URL or bare domain
-    other   : anything unclassifiable (returned for stats, not written)"""
+    other   : anything unclassifiable (returned for stats, not written)
+    domain  : service the line belongs to (from url prefix / Domain= / email)"""
+    # url | rest  (e.g. 'https://netflix.com/browse | netflixid=...; Secure')
+    if b'|' in raw:
+        pre, rest = raw.split(b'|', 1)
+        dom = extract_domain(pre.strip())
+        if dom and b'.' in dom:
+            rest = rest.strip()
+            if b'=' in rest:
+                return "cookie", rest, dom
+            lp = rest.split(b':', 1)
+            if len(lp) == 2 and lp[0] and lp[1]:
+                return "creds", rest, dom
+            return "cookie", rest, dom
+    # url:login:pass  (ComboFilter output format)
     parts = raw.rsplit(b':', 2)
     if len(parts) == 3 and all(parts):
         url, login, pwd = parts
         dom = extract_domain(url)
-        if dom and b'.' in dom:
-            # url:login:pass combo — domain is the service
-            return "url", login + b':' + pwd, dom
+        if b'://' in url or (dom and b'.' in dom):
+            return "creds", login + b':' + pwd, dom if (dom and b'.' in dom) else b''
     # cookie?
     if b'=' in raw and (b';' in raw or b'=' in raw):
         eqs = re.findall(rb"[\w.\-\[\]]+\s*=\s*[^;\s]+", raw)
@@ -250,20 +269,24 @@ def run(input_path, outdir, quiet):
                         stats["domains"][key] = stats["domains"].get(key, 0) + 1
                     else:
                         stats["domains"]["unknown"] = stats["domains"].get("unknown", 0) + 1
-                    # plan hints
+                    # plan hints — value tokens only (strip cookie attributes)
+                    scan = payload.lower()
+                    # strip Domain=/Path=/Expires=... attribute values so the
+                    # service name can't produce a false plan hint
+                    plain = re.sub(rb"(?:domain|path|expires|max-age|samesite)\s*=\s*[^;]*", b"", scan)
                     hint_any = False
-                    for h in PLAN_HINTS:
-                        if h in payload.lower():
-                            stats["plan_hints"][h.decode()] = stats["plan_hints"].get(h.decode(), 0) + 1
-                            hint_any = True
+                    for m in PLAN_RE.finditer(plain):
+                        h = m.group(1).decode()
+                        stats["plan_hints"][h] = stats["plan_hints"].get(h, 0) + 1
+                        hint_any = True
                     if hint_any:
                         stats["with_plan_hint"] += 1
                     else:
                         stats["without_plan_hint"] += 1
-                    # cookie names
-                    for n in COOKIE_NAMES:
-                        if n.lower() in payload.lower():
-                            stats["cookie_names"][n.decode()] = stats["cookie_names"].get(n.decode(), 0) + 1
+                    # cookie key names — single combined regex pass
+                    for m in COOKIE_KEY_RE.finditer(payload):
+                        label = (m.group(1) or (b"__Secure-" if m.group(0) == b"__Secure-" else b"__Host-")).decode()
+                        stats["cookie_names"][label] = stats["cookie_names"].get(label, 0) + 1
                 else:
                     stats["malformed"] += 1
 
@@ -287,14 +310,20 @@ def run(input_path, outdir, quiet):
                     key = sanitize_name(registrable(dom))
                     pool.write(key, payload)
                     stats["domains"][key] = stats["domains"].get(key, 0) + 1
-                for h in PLAN_HINTS:
-                    if h in payload.lower():
-                        stats["plan_hints"][h.decode()] = stats["plan_hints"].get(h.decode(), 0) + 1
+                    # plan hints — value tokens only (strip cookie attributes)
+                    scan = payload.lower()
+                    plain = re.sub(rb"(?:domain|path|expires|max-age|samesite)\s*=\s*[^;]*", b"", scan)
+                    hint_any = False
+                    for m in PLAN_RE.finditer(plain):
+                        h = m.group(1).decode()
+                        stats["plan_hints"][h] = stats["plan_hints"].get(h, 0) + 1
+                        hint_any = True
+                    if hint_any:
                         stats["with_plan_hint"] += 1
-                        break
-                for n in COOKIE_NAMES:
-                    if n.lower() in payload.lower():
-                        stats["cookie_names"][n.decode()] = stats["cookie_names"].get(n.decode(), 0) + 1
+                    # cookie key names — single combined regex pass
+                    for m in COOKIE_KEY_RE.finditer(payload):
+                        label = (m.group(1) or (b"__Secure-" if m.group(0) == b"__Secure-" else b"__Host-")).decode()
+                        stats["cookie_names"][label] = stats["cookie_names"].get(label, 0) + 1
 
     pool.close_all()
     stats["unique_services"] = len(stats["domains"])
