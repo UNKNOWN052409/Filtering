@@ -8,7 +8,9 @@ import (
 	"net/http"
 	"os"
 	"os/signal"
+	"path/filepath"
 	"strings"
+	"sync/atomic"
 	"syscall"
 	"time"
 )
@@ -16,11 +18,12 @@ import (
 // ───────────────── Worker Node ─────────────────
 
 type Worker struct {
-	config    MeshConfig
+	config         MeshConfig
 	coordinatorURL string
-	token     string
-	nodeID    int
-	email     string
+	token          string
+	nodeID         int
+	email          string
+	busy           atomic.Bool // drives the status field reported in heartbeats
 }
 
 func NewWorker(cfg MeshConfig, coordinatorAddr string) *Worker {
@@ -101,39 +104,109 @@ func (w *Worker) pollTask() *TaskResp {
 	return &resp
 }
 
+// results written locally on this node (survives even if drive sync fails)
+const resultsDir = "mesh_results"
+
 func (w *Worker) processTask(task *TaskResp) {
-	// download chunk if available (for now, keywords-only tasks)
-	// process each keyword against the combo lines
-	// In a real setup, the chunk would be downloaded from chunkURL
-	// For now, we report ready and wait for next task
-
 	start := time.Now()
-	w.sendHeartbeat("busy", 0, 0)
+	w.busy.Store(true)
+	defer w.busy.Store(false)
 
-	// simulate processing (replace with actual combofilter engine call)
-	time.Sleep(1 * time.Second)
+	if task.Data == "" {
+		log.Printf("[worker] task %s has no chunk data — skipping", task.TaskID[:8])
+		return
+	}
 
-	// submit results
+	keywords := make([]string, len(task.Keywords))
+	kwSan := make([]string, len(task.Keywords))
+	hits := make([]int64, len(task.Keywords))
+	payloads := make([][]string, len(task.Keywords))
+	for i, kw := range task.Keywords {
+		keywords[i] = strings.ToLower(kw)
+		kwSan[i] = sanitizeName(keywords[i])
+	}
+
+	var lines, malformed, totalHits int64
+	for _, line := range strings.Split(task.Data, "\n") {
+		line = strings.TrimRight(line, "\r")
+		if line == "" {
+			continue
+		}
+		lines++
+		url, login, pwd := splitCombo([]byte(line))
+		if len(url) == 0 || len(login) == 0 || len(pwd) == 0 {
+			malformed++
+			continue
+		}
+		domain := extractDomain(url)
+		if domain == "" || !strings.Contains(domain, ".") {
+			malformed++
+			continue
+		}
+		// valid combo: count hits per matching keyword (notnetflix.com style
+		// domains simply match nothing — same semantics as combofilter.py)
+		for i, kw := range keywords {
+			if domainMatches(domain, kw) {
+				payloads[i] = append(payloads[i], string(login)+":"+string(pwd))
+				hits[i]++
+				totalHits++
+			}
+		}
+	}
+
+	// write locally first — results exist even if the submit/drive fails
+	os.MkdirAll(resultsDir, 0755)
+	var results []KeywordResult
+	for i, kw := range keywords {
+		if hits[i] == 0 {
+			continue
+		}
+		fpath := filepath.Join(resultsDir,
+			fmt.Sprintf("%s_%s_node%d.txt", kwSan[i], task.TaskID[:8], w.nodeID))
+		if f, err := os.OpenFile(fpath, os.O_CREATE|os.O_WRONLY|os.O_APPEND, 0644); err == nil {
+			for _, p := range payloads[i] {
+				fmt.Fprintln(f, p)
+			}
+			f.Close()
+		} else {
+			log.Printf("[worker] local write failed %s: %v", fpath, err)
+		}
+		results = append(results, KeywordResult{
+			Keyword:  kw,
+			Lines:    hits[i],
+			Hits:     hits[i],
+			Payloads: payloads[i],
+		})
+	}
+
+	// submit counts + payloads to coordinator for drive sync
 	result := ResultSubmit{
 		Token:     w.token,
 		TaskID:    task.TaskID,
-		Lines:     0,
-		Hits:      0,
-		Malformed: 0,
+		Results:   results,
+		Lines:     lines,
+		Hits:      totalHits,
+		Malformed: malformed,
 		Duration:  time.Since(start).Seconds(),
 	}
 	var resp ResultResp
 	if err := w.post("/api/result", result, &resp); err != nil {
 		log.Printf("[worker] result submit failed: %v", err)
+		return // coordinator never got them — local copy still holds them
 	}
 
-	w.sendHeartbeat("idle", 0, 0)
+	log.Printf("[worker] task %s done: %d lines, %d hits, %d malformed in %.1fs",
+		task.TaskID[:8], lines, totalHits, malformed, result.Duration)
 }
 
 func (w *Worker) heartbeatLoop() {
 	ticker := time.NewTicker(time.Duration(w.config.HeartbeatInterval) * time.Second)
 	for range ticker.C {
-		w.sendHeartbeat("idle", 0, 0)
+		status := "idle"
+		if w.busy.Load() {
+			status = "busy"
+		}
+		w.sendHeartbeat(status, 0, 0)
 	}
 }
 

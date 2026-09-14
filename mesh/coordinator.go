@@ -29,11 +29,14 @@ type Task struct {
 }
 
 type Coordinator struct {
-	mu      sync.RWMutex
-	config  MeshConfig
-	tasks   map[string]*Task
-	nodes   map[string]*NodeInfo // token → node info
-	pending chan string           // task IDs ready for assignment
+	mu           sync.RWMutex
+	config       MeshConfig
+	tasks        map[string]*Task
+	nodes        map[string]*NodeInfo // token → node info
+	nodesByEmail map[string]string    // email → token (dedupe: one entry per node)
+	totalLines   int64
+	totalHits    int64
+	pending      chan string // task IDs ready for assignment
 }
 
 type NodeInfo struct {
@@ -49,10 +52,11 @@ type NodeInfo struct {
 
 func NewCoordinator(cfg MeshConfig) *Coordinator {
 	return &Coordinator{
-		config:  cfg,
-		tasks:   make(map[string]*Task),
-		nodes:   make(map[string]*NodeInfo),
-		pending: make(chan string, 100),
+		config:       cfg,
+		tasks:        make(map[string]*Task),
+		nodes:        make(map[string]*NodeInfo),
+		nodesByEmail: make(map[string]string),
+		pending:      make(chan string, 100),
 	}
 }
 
@@ -101,6 +105,12 @@ func (c *Coordinator) handleRegister(w http.ResponseWriter, r *http.Request) {
 
 	token := genToken()
 	c.mu.Lock()
+	// dedupe: a node that restarts re-registers under the same email — drop the
+	// stale token entry so active_nodes doesn't grow one ghost per restart
+	if oldTok, exists := c.nodesByEmail[req.Email]; exists {
+		delete(c.nodes, oldTok)
+	}
+	c.nodesByEmail[req.Email] = token
 	c.nodes[token] = &NodeInfo{
 		ID:       req.NodeID,
 		Email:    req.Email,
@@ -126,8 +136,8 @@ func (c *Coordinator) handleHeartbeat(w http.ResponseWriter, r *http.Request) {
 	if n, ok := c.nodes[req.Token]; ok {
 		n.Status = req.Status
 		n.LastSeen = time.Now()
-		n.Lines = req.Lines
-		n.Hits = req.Hits
+		// NOTE: do NOT assign n.Lines/n.Hits here — heartbeats carry no real
+		// counts and would clobber the accumulated values from result submits
 	}
 	c.mu.Unlock()
 	jsonResp(w, map[string]bool{"ok": true})
@@ -165,6 +175,7 @@ func (c *Coordinator) handleTaskRequest(w http.ResponseWriter, r *http.Request) 
 				OK:       true,
 				TaskID:   task.ID,
 				Keywords: task.Keywords,
+				Data:     string(task.Chunk), // deliver the actual combo lines
 				Lines:    task.Lines,
 				Message:  "processing",
 			})
@@ -184,19 +195,28 @@ func (c *Coordinator) handleSubmitResult(w http.ResponseWriter, r *http.Request)
 	}
 
 	c.mu.Lock()
-	task, ok := c.tasks[req.TaskID]
-	if ok {
+	task, exists := c.tasks[req.TaskID]
+	// only a pending/assigned task counts as a fresh completion — a duplicate
+	// or late submit for an already-done task must not double-count
+	fresh := exists && task.Status != "done"
+	if exists {
 		task.Status = "done"
 		task.Results = req.Results
 	}
 	if n, ok := c.nodes[req.Token]; ok {
 		n.Status = "idle"
-		n.Lines += req.Lines
-		n.Hits += req.Hits
+	}
+	if fresh {
+		c.totalLines += req.Lines
+		c.totalHits += req.Hits
+		if n, ok := c.nodes[req.Token]; ok {
+			n.Lines += req.Lines
+			n.Hits += req.Hits
+		}
 	}
 	c.mu.Unlock()
 
-	if ok {
+	if fresh {
 		log.Printf("[coordinator] task %s done: %d lines, %d hits, %.1fs",
 			req.TaskID[:8], req.Lines, req.Hits, req.Duration)
 	}
@@ -312,6 +332,8 @@ func (c *Coordinator) handleStatus(w http.ResponseWriter, r *http.Request) {
 		TotalTasks:  total,
 		DoneTasks:   done,
 		ActiveNodes: len(c.nodes),
+		TotalLines:  c.totalLines,
+		TotalHits:   c.totalHits,
 		Nodes:       nodes,
 	})
 }
@@ -350,29 +372,30 @@ func (c *Coordinator) syncToDrive() {
 		c.mu.RLock()
 		doneTasks := []*Task{}
 		for _, t := range c.tasks {
-			if t.Status == "done" && len(t.Results) > 0 {
+			if t.Status == "done" {
 				doneTasks = append(doneTasks, t)
 			}
 		}
 		c.mu.RUnlock()
-
 		if len(doneTasks) == 0 {
 			continue
 		}
 
-		// write results to local temp dir
+		// stage payloads in a transient dir — rebuilt from in-memory task
+		// results every pass, so it can never accumulate stale files
 		tmpDir := filepath.Join(os.TempDir(), "mesh_results")
 		os.MkdirAll(tmpDir, 0755)
-
+		staged := map[string]bool{}
 		for _, task := range doneTasks {
 			for _, kr := range task.Results {
-				if kr.Hits == 0 {
+				if len(kr.Payloads) == 0 {
 					continue
 				}
 				fname := fmt.Sprintf("%s_%s.txt", sanitizeName(kr.Keyword), task.ID[:8])
-				fpath := filepath.Join(tmpDir, fname)
-				f, err := os.OpenFile(fpath, os.O_CREATE|os.O_WRONLY|os.O_APPEND, 0644)
+				f, err := os.OpenFile(filepath.Join(tmpDir, fname),
+					os.O_CREATE|os.O_WRONLY|os.O_APPEND, 0644)
 				if err != nil {
+					log.Printf("[coordinator] stage write failed: %v", err)
 					continue
 				}
 				for _, p := range kr.Payloads {
@@ -380,21 +403,33 @@ func (c *Coordinator) syncToDrive() {
 				}
 				f.Close()
 			}
+			if len(task.Results) > 0 {
+				staged[task.ID] = true
+			}
 		}
 
-		// rclone copy to drive
-		remote := c.config.RcloneRemote + c.config.DriveSyncPath
-		cmd := exec.Command("rclone", "copy", tmpDir, remote, "--update")
-		if output, err := cmd.CombinedOutput(); err != nil {
-			log.Printf("[coordinator] rclone sync failed: %v — %s", err, string(output))
-		} else {
-			log.Printf("[coordinator] synced %d task results to %s", len(doneTasks), remote)
+		// nothing staged → nothing to push, safe to drop
+		syncOK := len(staged) == 0
+		if len(staged) > 0 {
+			remote := c.config.RcloneRemote + c.config.DriveSyncPath
+			cmd := exec.Command("rclone", "copy", tmpDir, remote, "--update")
+			if output, err := cmd.CombinedOutput(); err != nil {
+				log.Printf("[coordinator] rclone sync FAILED — keeping %d task(s) for retry: %v — %s",
+					len(staged), err, string(output))
+			} else {
+				syncOK = true
+				log.Printf("[coordinator] synced %d task result set(s) to %s", len(staged), remote)
+			}
 		}
+		os.RemoveAll(tmpDir)
 
-		// clean synced tasks
+		// drop done tasks: all of them once the push succeeded (or there was
+		// nothing to push); on failure keep staged tasks so no data is lost
 		c.mu.Lock()
 		for _, task := range doneTasks {
-			delete(c.tasks, task.ID)
+			if syncOK || !staged[task.ID] {
+				delete(c.tasks, task.ID)
+			}
 		}
 		c.mu.Unlock()
 	}

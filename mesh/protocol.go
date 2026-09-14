@@ -48,12 +48,12 @@ type TaskRequest struct {
 }
 
 type TaskResp struct {
-	OK       bool   `json:"ok"`
-	TaskID   string `json:"task_id"`
+	OK       bool     `json:"ok"`
+	TaskID   string   `json:"task_id"`
 	Keywords []string `json:"keywords"`
-	ChunkURL string `json:"chunk_url"` // URL to download the combo chunk
-	Lines    int    `json:"lines"`
-	Message  string `json:"message"`
+	Data     string   `json:"data"` // raw combo chunk lines (newline-joined) sent inline
+	Lines    int      `json:"lines"`
+	Message  string   `json:"message"`
 }
 
 type ResultSubmit struct {

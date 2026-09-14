@@ -13,3 +13,5 @@ combo_results/
 __pycache__/
 mesh/nodes.json
 mesh/mesh.exe
+mesh/nodes.json
+mesh/mesh_results/
