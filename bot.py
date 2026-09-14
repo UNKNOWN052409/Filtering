@@ -13,7 +13,7 @@ Modes: AUTO (sort everything by domain/category) or KEYWORDS (targeted).
 Live stats via message edits while processing. Results sent back as files.
 """
 
-import os, re, io, sys, time, json, random, zipfile, logging, threading
+import os, re, io, sys, time, json, random, zipfile, logging, threading, traceback, tempfile
 import requests
 
 TOKEN = ""
@@ -23,7 +23,20 @@ elif len(sys.argv) > 1:
     TOKEN = sys.argv[1]
 API = f"https://api.telegram.org/bot{TOKEN}"
 DL = f"https://api.telegram.org/file/bot{TOKEN}"
-WORK = os.path.expanduser("~/Filtering/bot_results")
+# WORK dir: BOT_WORK env override, else ~/Filtering/bot_results, else a
+# writable temp dir — the home drive can be full (C: was 100%), so never
+# hard-fail at import time just because the default path isn't writable.
+def _pick_work():
+    cand = os.environ.get("BOT_WORK") or os.path.expanduser("~/Filtering/bot_results")
+    try:
+        os.makedirs(cand, exist_ok=True)
+        return cand
+    except OSError:
+        import tempfile
+        fallback = os.path.join(tempfile.gettempdir(), "bot_results")
+        os.makedirs(fallback, exist_ok=True)
+        return fallback
+WORK = _pick_work()
 MB20 = 20 * 1024 * 1024          # telegram bot download cap
 EDIT_EVERY = 2.0                  # sec between live-stat edits
 
@@ -124,9 +137,18 @@ def extract_domain(url):
     if d.startswith("www."): d = d[4:]
     return d if DOM_RE.match(d) else ""
 
+TLD2 = {"co.uk","org.uk","ac.uk","gov.uk","co.in","co.jp","or.jp","co.kr",
+        "com.au","net.au","org.au","com.br","com.mx","com.ar","co.nz","com.cn",
+        "com.tw","co.za","com.sg","co.id"}
+
 def registrable(dom):
-    p = dom.rsplit(".", 2)
-    return f"{p[-2]}.{p[-1]}" if len(p) == 3 else dom
+    """login.netflix.com -> netflix.com ; mail.yahoo.co.uk -> yahoo.co.uk"""
+    labels = dom.split(".")
+    if len(labels) <= 2:
+        return dom
+    if len(labels) >= 3 and f"{labels[-2]}.{labels[-1]}" in TLD2:
+        return ".".join(labels[-3:])
+    return ".".join(labels[-2:])
 
 def phone_cc(login):
     digits = re.sub(r"\D", "", login)
@@ -183,21 +205,36 @@ class Engine(threading.Thread):
         self.bot, self.chat, self.src, self.kws, self.auto = bot, chat, src_path, kws, auto
         self.run_id = random.randint(10**17, 10**18 - 1)
         self.out = os.path.join(WORK, str(self.run_id))
-        os.makedirs(self.out, exist_ok=True)
+        try:
+            os.makedirs(self.out, exist_ok=True)
+        except OSError:
+            self.out = os.path.join(tempfile.gettempdir(), str(self.run_id))
+            os.makedirs(self.out, exist_ok=True)
         self.stop = False
+        self.write_failed = False
         self.files, self.counts = {}, {}
         self.lines = self.hits = self.bad = self.seen_dup = 0
         self.t0 = None
 
     def w(self, name, payload):
+        if self.write_failed:                     # disk full — stop hammering it
+            return
         path = os.path.join(self.out, f"{safe_name(name)}_{self.run_id}.txt")
-        h = self.files.get(path)
-        if h is None:
-            if len(self.files) >= 256:                      # LRU-ish cap
-                old = next(iter(self.files.values())); old.close()
-            h = open(path, "a", encoding="utf-8"); self.files[path] = h
-        h.write(payload + "\n")
-        self.counts[name] = self.counts.get(name, 0) + 1
+        try:
+            h = self.files.get(path)
+            if h is None:
+                if len(self.files) >= 256:          # LRU cap
+                    old_path, old = next(iter(self.files.items()))
+                    old.close()
+                    del self.files[old_path]
+                h = open(path, "a", encoding="utf-8"); self.files[path] = h
+            else:
+                self.files[path] = self.files.pop(path)   # touch -> most-recent
+            h.write(payload + "\n")
+            self.counts[name] = self.counts.get(name, 0) + 1
+            self.hits += 1
+        except OSError:
+            self.write_failed = True                 # surface "disk full" not a crash
 
     def run(self):
         self.t0 = time.time()
@@ -256,8 +293,9 @@ class Engine(threading.Thread):
         total = sum(self.counts.values())
         rows = "".join(f"\n<code>{k[:28]:<28}</code>{v:>9,}" for k, v in
                        sorted(self.counts.items(), key=lambda x: -x[1])[:15])
+        note = " ⚠️ disk-full — output truncated" if self.write_failed else ""
         msg = (f"✅ <b>DONE</b> — {el:.1f}s | {self.lines:,} lines | {total:,} sorted\n"
-               f"files: {len(self.counts)}{rows}")
+               f"files: {len(self.counts)}{rows}{note}")
         self.bot.edit(self.chat, msg)
         # ship files — ONLY from THIS run's dir, never a stale one
         if not self.counts:
@@ -346,7 +384,8 @@ class Bot:
         if doc:
             if self.state.get(chat) == "busy":
                 tg_send(chat, "⏳ busy — /cancel pehle"); return
-            name = doc.get("file_name", "combo.txt")
+            name = os.path.basename(doc.get("file_name", "combo.txt")).replace("\\", "")
+            name = re.sub(r"[^A-Za-z0-9._-]", "_", name) or "combo.txt"
             if not name.lower().endswith(".txt"):
                 tg_send(chat, "❌ only .txt files"); return
             if doc.get("file_size", 0) > MB20:

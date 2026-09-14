@@ -8,3 +8,6 @@ checker/out/
 __pycache__/
 bot.log
 *.log
+combo_results/
+*.exe
+__pycache__/

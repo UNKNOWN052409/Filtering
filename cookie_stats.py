@@ -69,7 +69,9 @@ DOMAIN_RE = re.compile(rb"^[a-z0-9][a-z0-9.\-]*\.[a-z]{2,}$", re.I)
 
 
 def extract_domain(url):
-    """Same as ComboFilter — bare lowercase host out of any URL form."""
+    """Same as ComboFilter — bare lowercase host out of any URL form.
+    Returns b'' when the token is not a real domain, so a cookie payload like
+    'nflx.com=premium-plan; Path=/' can't masquerade as a service name."""
     d = url
     i = d.find(b'://')
     if i != -1:
@@ -89,14 +91,24 @@ def extract_domain(url):
         d = d[4:]
     if d.endswith(b'.'):
         d = d[:-1]
-    return d
+    return d if DOMAIN_RE.match(d) else b''
 
 
 def registrable(domain):
-    parts = domain.rsplit(b'.', 2)
-    if len(parts) == 2:
+    """accounts.netflix.com -> netflix.com; mail.yahoo.co.uk -> yahoo.co.uk"""
+    labels = domain.split(b'.')
+    if len(labels) <= 2:
         return domain
-    return parts[-2] + b'.' + parts[-1] if len(parts) == 3 else domain
+    if len(labels) >= 3 and labels[-2] + b'.' + labels[-1] in TWO_LEVEL_TLDS:
+        return b'.'.join(labels[-3:])
+    return b'.'.join(labels[-2:])
+
+
+TWO_LEVEL_TLDS = {
+    b'co.uk', b'org.uk', b'ac.uk', b'gov.uk', b'co.in', b'co.jp', b'or.jp',
+    b'co.kr', b'com.au', b'net.au', b'org.au', b'com.br', b'com.mx', b'com.ar',
+    b'co.nz', b'com.cn', b'com.tw', b'co.za', b'com.sg', b'co.id',
+}
 
 
 def sanitize_name(name_bytes):
@@ -104,6 +116,17 @@ def sanitize_name(name_bytes):
     for ch in '\\/:*?"<>| \t':
         s = s.replace(ch, '_')
     return s or 'unknown'
+
+
+def cookie_key_label(m):
+    """Normalize a COOKIE_KEY_RE match into a lowercase key name for counting.
+
+    Named keys (netflixid, session, auth, ...) -> the key itself. The
+    __Secure-/__Host- prefix branch has no key after it, so the prefix is
+    the label. Lowercased so case variants count together.
+    """
+    key = m.group(1) if m.group(1) is not None else m.group(0)
+    return key.decode("ascii", "replace").lower()
 
 
 def cookie_domain_hint(raw):
@@ -174,6 +197,32 @@ def classify_raw(raw):
     if d and b'.' in d:
         return "url", raw, d
     return "other", raw, b''
+
+
+def account_cookie(stats, pool, dom, payload):
+    """Full accounting for one cookie line — shared by the main loop and the
+    no-trailing-newline tail so the last line can't silently lose stats."""
+    stats["valid_format"] += 1
+    if dom:
+        key = sanitize_name(registrable(dom))
+        pool.write(key, payload)
+        stats["domains"][key] = stats["domains"].get(key, 0) + 1
+    else:
+        stats["domains"]["unknown"] = stats["domains"].get("unknown", 0) + 1
+    # plan hints — value tokens only (strip Domain=/Path=/Expires=... values
+    # so the service name can't produce a false plan hint)
+    plain = re.sub(rb"(?:domain|path|expires|max-age|samesite)\s*=\s*[^;]*",
+                   b"", payload.lower())
+    hint_any = False
+    for m in PLAN_RE.finditer(plain):
+        h = m.group(1).decode()
+        stats["plan_hints"][h] = stats["plan_hints"].get(h, 0) + 1
+        hint_any = True
+    stats["with_plan_hint" if hint_any else "without_plan_hint"] += 1
+    # cookie key names — single combined regex pass
+    for m in COOKIE_KEY_RE.finditer(payload):
+        label = cookie_key_label(m)
+        stats["cookie_names"][label] = stats["cookie_names"].get(label, 0) + 1
 
 
 class OutputPool:
@@ -262,31 +311,7 @@ def run(input_path, outdir, quiet):
                 stats[kind] += 1
 
                 if kind == "cookie":
-                    stats["valid_format"] += 1
-                    if dom:
-                        key = sanitize_name(registrable(dom)) if dom else "unknown"
-                        pool.write(key, payload)
-                        stats["domains"][key] = stats["domains"].get(key, 0) + 1
-                    else:
-                        stats["domains"]["unknown"] = stats["domains"].get("unknown", 0) + 1
-                    # plan hints — value tokens only (strip cookie attributes)
-                    scan = payload.lower()
-                    # strip Domain=/Path=/Expires=... attribute values so the
-                    # service name can't produce a false plan hint
-                    plain = re.sub(rb"(?:domain|path|expires|max-age|samesite)\s*=\s*[^;]*", b"", scan)
-                    hint_any = False
-                    for m in PLAN_RE.finditer(plain):
-                        h = m.group(1).decode()
-                        stats["plan_hints"][h] = stats["plan_hints"].get(h, 0) + 1
-                        hint_any = True
-                    if hint_any:
-                        stats["with_plan_hint"] += 1
-                    else:
-                        stats["without_plan_hint"] += 1
-                    # cookie key names — single combined regex pass
-                    for m in COOKIE_KEY_RE.finditer(payload):
-                        label = (m.group(1) or (b"__Secure-" if m.group(0) == b"__Secure-" else b"__Host-")).decode()
-                        stats["cookie_names"][label] = stats["cookie_names"].get(label, 0) + 1
+                    account_cookie(stats, pool, dom, payload)
                 else:
                     stats["malformed"] += 1
 
@@ -305,25 +330,9 @@ def run(input_path, outdir, quiet):
             stats["total_lines"] += 1
             stats[kind] += 1
             if kind == "cookie":
-                stats["valid_format"] += 1
-                if dom:
-                    key = sanitize_name(registrable(dom))
-                    pool.write(key, payload)
-                    stats["domains"][key] = stats["domains"].get(key, 0) + 1
-                    # plan hints — value tokens only (strip cookie attributes)
-                    scan = payload.lower()
-                    plain = re.sub(rb"(?:domain|path|expires|max-age|samesite)\s*=\s*[^;]*", b"", scan)
-                    hint_any = False
-                    for m in PLAN_RE.finditer(plain):
-                        h = m.group(1).decode()
-                        stats["plan_hints"][h] = stats["plan_hints"].get(h, 0) + 1
-                        hint_any = True
-                    if hint_any:
-                        stats["with_plan_hint"] += 1
-                    # cookie key names — single combined regex pass
-                    for m in COOKIE_KEY_RE.finditer(payload):
-                        label = (m.group(1) or (b"__Secure-" if m.group(0) == b"__Secure-" else b"__Host-")).decode()
-                        stats["cookie_names"][label] = stats["cookie_names"].get(label, 0) + 1
+                account_cookie(stats, pool, dom, payload)
+            else:
+                stats["malformed"] += 1
 
     pool.close_all()
     stats["unique_services"] = len(stats["domains"])

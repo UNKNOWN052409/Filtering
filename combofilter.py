@@ -60,12 +60,23 @@ def extract_domain(url):
     return d
 
 
+# two-level public suffixes seen in combo lists (small table, not full PSL)
+TWO_LEVEL_TLDS = {
+    b'co.uk', b'org.uk', b'ac.uk', b'gov.uk', b'co.in', b'co.jp', b'or.jp',
+    b'co.kr', b'com.au', b'net.au', b'org.au', b'com.br', b'com.mx', b'com.ar',
+    b'co.nz', b'com.cn', b'com.tw', b'co.za', b'com.sg', b'co.id',
+}
+
+
 def registrable(domain):
-    """Collapse a subdomain to its parent site: accounts.netflix.com -> netflix.com"""
-    parts = domain.rsplit(b'.', 2)
-    if len(parts) == 2:
+    """Collapse a subdomain to its parent site: accounts.netflix.com -> netflix.com.
+    Handles two-level suffixes too: mail.yahoo.co.uk -> yahoo.co.uk"""
+    labels = domain.split(b'.')
+    if len(labels) <= 2:
         return domain
-    return parts[-2] + b'.' + parts[-1] if len(parts) == 3 else domain
+    if len(labels) >= 3 and labels[-2] + b'.' + labels[-1] in TWO_LEVEL_TLDS:
+        return b'.'.join(labels[-3:])
+    return b'.'.join(labels[-2:])
 
 
 def normalize_keyword(kw):
@@ -177,8 +188,9 @@ def run(input_path, keywords, auto_mode, outdir, dedupe, quiet):
     os.makedirs(outdir, exist_ok=True)
     pool = OutputPool(outdir, run_id, dedupe=dedupe)
 
-    # normalized keyword bytes
-    kw_list = [normalize_keyword(k) for k in keywords]
+    # normalized keyword bytes — deduped (same kw twice must not double-write)
+    kw_list = list(dict.fromkeys(
+        k for k in (normalize_keyword(x) for x in keywords) if k))
     kw_counts = {k: 0 for k in kw_list}
 
     lines = matched = malformed = empty = 0
@@ -219,28 +231,29 @@ def run(input_path, keywords, auto_mode, outdir, dedupe, quiet):
                     malformed += 1
                     continue
 
-                lines += 1
                 domain = extract_domain(url)
                 if not domain or b'.' not in domain:
                     malformed += 1
                     continue
 
+                lines += 1
                 payload = login + b':' + pwd
 
-                hit_any = False
+                hit_kw = False
+                written = False
                 if kw_list:
                     for kw in kw_list:
                         if domain_matches(domain, kw):
-                            name = sanitize_name(kw)
-                            if pool.write(name, payload):
+                            hit_kw = True
+                            if pool.write(sanitize_name(kw), payload):
                                 kw_counts[kw] += 1
-                            hit_any = True
-                if hit_any:
+                                written = True
+                if written:
                     matched += 1
 
                 # auto mode writes every discovered domain EXCEPT ones already
                 # captured by a keyword, so combined mode never duplicates lines
-                if auto_mode and not hit_any:
+                if auto_mode and not hit_kw:
                     name = sanitize_name(registrable(domain))
                     pool.write(name, payload)
 
@@ -252,23 +265,36 @@ def run(input_path, keywords, auto_mode, outdir, dedupe, quiet):
                              now - last_render, now - t0)
                 last_render = now
 
-        # final partial line
+        # final partial line (mirror the main loop so the counters stay consistent)
         if tail:
             raw = tail.rstrip(b'\r\n')
-            parts = raw.rsplit(b':', 2)
-            if len(parts) == 3 and all(parts):
-                lines += 1
-                domain = extract_domain(parts[0])
-                if domain and b'.' in domain:
-                    payload = parts[1] + b':' + parts[2]
-                    hit = False
-                    for kw in kw_list:
-                        if domain_matches(domain, kw):
-                            if pool.write(sanitize_name(kw), payload):
-                                kw_counts[kw] += 1
-                            hit = matched = True
-                    if auto_mode and not hit:
-                        pool.write(sanitize_name(registrable(domain)), payload)
+            if not raw:
+                empty += 1
+            else:
+                parts = raw.rsplit(b':', 2)
+                if len(parts) != 3:
+                    malformed += 1
+                elif not all(parts):
+                    malformed += 1
+                else:
+                    domain = extract_domain(parts[0])
+                    if not domain or b'.' not in domain:
+                        malformed += 1
+                    else:
+                        lines += 1
+                        payload = parts[1] + b':' + parts[2]
+                        hit_kw = False
+                        written = False
+                        for kw in kw_list:
+                            if domain_matches(domain, kw):
+                                hit_kw = True
+                                if pool.write(sanitize_name(kw), payload):
+                                    kw_counts[kw] += 1
+                                    written = True
+                        if written:
+                            matched += 1
+                        if auto_mode and not hit_kw:
+                            pool.write(sanitize_name(registrable(domain)), payload)
 
     pool.close_all()
     return pool, kw_list, kw_counts, lines, matched, malformed, empty, run_id

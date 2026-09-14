@@ -43,9 +43,13 @@ lines.append("https://netflix.com:cool@netflix.com:88/x:y:z")  # user:pass@host:
 lines.append("https://t.co:1:2")                # short domain
 lines.append("ftp://files.spotify.com:2121/a/b:login:pwd")
 
-with open("/home/kali/Filtering/test_combos.txt", "w", newline="") as f:
-    f.write("\ufeff")  # BOM on first line
+import os
+import sys
+
+out_path = sys.argv[1] if len(sys.argv) > 1 else "test_combos.txt"
+with open(out_path, "w", newline="") as f:
+    f.write("﻿")  # BOM on first line
     f.write("\r\n".join(lines[:50]) + "\r\n")  # first 50 CRLF
     f.write("\n".join(lines[50:]))             # rest LF
 
-print(f"wrote {len(lines)} lines")
+print(f"wrote {len(lines)} lines -> {os.path.abspath(out_path)}")

