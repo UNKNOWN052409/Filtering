@@ -1,2 +1,0 @@
-http://example.com:u1:p1
-justtext:u2:p2

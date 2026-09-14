@@ -16,3 +16,7 @@ mesh/mesh.exe
 mesh/nodes.json
 mesh/mesh_results/
 *.exe~
+out/
+res_a/
+res_b/
+tail_probe.txt
