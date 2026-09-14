@@ -1,0 +1,428 @@
+package main
+
+import (
+	"crypto/rand"
+	"encoding/json"
+	"fmt"
+	"io"
+	"log"
+	"math/big"
+	"net/http"
+	"os"
+	"os/exec"
+	"path/filepath"
+	"strings"
+	"sync"
+	"time"
+)
+
+// ───────────────── Coordinator ─────────────────
+
+type Task struct {
+	ID       string
+	Keywords []string
+	Chunk    []byte // raw combo lines for this chunk
+	Lines    int
+	Status   string // "pending" | "assigned" | "done"
+	Assigned string // node token
+	Results  []KeywordResult
+}
+
+type Coordinator struct {
+	mu      sync.RWMutex
+	config  MeshConfig
+	tasks   map[string]*Task
+	nodes   map[string]*NodeInfo // token → node info
+	pending chan string           // task IDs ready for assignment
+}
+
+type NodeInfo struct {
+	ID       int
+	Email    string
+	Token    string
+	Hostname string
+	Status   string
+	LastSeen time.Time
+	Lines    int64
+	Hits     int64
+}
+
+func NewCoordinator(cfg MeshConfig) *Coordinator {
+	return &Coordinator{
+		config:  cfg,
+		tasks:   make(map[string]*Task),
+		nodes:   make(map[string]*NodeInfo),
+		pending: make(chan string, 100),
+	}
+}
+
+func (c *Coordinator) Run(addr string) {
+	mux := http.NewServeMux()
+	mux.HandleFunc("/api/register", c.handleRegister)
+	mux.HandleFunc("/api/heartbeat", c.handleHeartbeat)
+	mux.HandleFunc("/api/task", c.handleTaskRequest)
+	mux.HandleFunc("/api/result", c.handleSubmitResult)
+	mux.HandleFunc("/api/upload", c.handleUpload)
+	mux.HandleFunc("/api/status", c.handleStatus)
+	mux.HandleFunc("/api/ping", c.handlePing)
+
+	// start background jobs
+	go c.monitorNodes()
+	go c.syncToDrive()
+
+	log.Printf("[coordinator] listening on %s", addr)
+	log.Fatal(http.ListenAndServe(addr, mux))
+}
+
+// ── POST /api/register ──
+func (c *Coordinator) handleRegister(w http.ResponseWriter, r *http.Request) {
+	if r.Method != "POST" {
+		http.Error(w, "POST only", 405)
+		return
+	}
+	var req RegisterReq
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		jsonError(w, "bad json", 400)
+		return
+	}
+
+	// validate credentials against config
+	valid := false
+	for _, n := range c.config.Nodes {
+		if n.Email == req.Email && n.Password == req.Password {
+			valid = true
+			break
+		}
+	}
+	if !valid {
+		jsonError(w, "invalid credentials", 401)
+		return
+	}
+
+	token := genToken()
+	c.mu.Lock()
+	c.nodes[token] = &NodeInfo{
+		ID:       req.NodeID,
+		Email:    req.Email,
+		Token:    token,
+		Hostname: req.Hostname,
+		Status:   "idle",
+		LastSeen: time.Now(),
+	}
+	c.mu.Unlock()
+
+	log.Printf("[coordinator] node registered: %s (%s) — token %s", req.Email, req.Hostname, token[:8])
+	jsonResp(w, RegisterResp{OK: true, NodeID: req.NodeID, Token: token, Message: "registered"})
+}
+
+// ── POST /api/heartbeat ──
+func (c *Coordinator) handleHeartbeat(w http.ResponseWriter, r *http.Request) {
+	var req HeartbeatReq
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		jsonError(w, "bad json", 400)
+		return
+	}
+	c.mu.Lock()
+	if n, ok := c.nodes[req.Token]; ok {
+		n.Status = req.Status
+		n.LastSeen = time.Now()
+		n.Lines = req.Lines
+		n.Hits = req.Hits
+	}
+	c.mu.Unlock()
+	jsonResp(w, map[string]bool{"ok": true})
+}
+
+// ── GET /api/task ──
+func (c *Coordinator) handleTaskRequest(w http.ResponseWriter, r *http.Request) {
+	token := r.URL.Query().Get("token")
+	if token == "" {
+		jsonError(w, "token required", 401)
+		return
+	}
+
+	c.mu.RLock()
+	_, ok := c.nodes[token]
+	c.mu.RUnlock()
+	if !ok {
+		jsonError(w, "invalid token", 401)
+		return
+	}
+
+	// find a pending task
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	for _, task := range c.tasks {
+		if task.Status == "pending" {
+			task.Status = "assigned"
+			task.Assigned = token
+			// update node status
+			if n, ok := c.nodes[token]; ok {
+				n.Status = "busy"
+			}
+			log.Printf("[coordinator] task %s assigned to node %s", task.ID[:8], token[:8])
+			jsonResp(w, TaskResp{
+				OK:       true,
+				TaskID:   task.ID,
+				Keywords: task.Keywords,
+				Lines:    task.Lines,
+				Message:  "processing",
+			})
+			return
+		}
+	}
+
+	jsonResp(w, TaskResp{OK: false, Message: "no tasks available"})
+}
+
+// ── POST /api/result ──
+func (c *Coordinator) handleSubmitResult(w http.ResponseWriter, r *http.Request) {
+	var req ResultSubmit
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		jsonError(w, "bad json", 400)
+		return
+	}
+
+	c.mu.Lock()
+	task, ok := c.tasks[req.TaskID]
+	if ok {
+		task.Status = "done"
+		task.Results = req.Results
+	}
+	if n, ok := c.nodes[req.Token]; ok {
+		n.Status = "idle"
+		n.Lines += req.Lines
+		n.Hits += req.Hits
+	}
+	c.mu.Unlock()
+
+	if ok {
+		log.Printf("[coordinator] task %s done: %d lines, %d hits, %.1fs",
+			req.TaskID[:8], req.Lines, req.Hits, req.Duration)
+	}
+	jsonResp(w, ResultResp{OK: true, Message: "received"})
+}
+
+// ── POST /api/upload (upload combo file) ──
+func (c *Coordinator) handleUpload(w http.ResponseWriter, r *http.Request) {
+	if r.Method != "POST" {
+		http.Error(w, "POST only", 405)
+		return
+	}
+
+	// parse multipart: file + keywords
+	if err := r.ParseMultipartForm(100 << 20); err != nil { // 100MB max
+		jsonError(w, "parse error: "+err.Error(), 400)
+		return
+	}
+
+	kwStr := r.FormValue("keywords")
+	keywords := strings.FieldsFunc(kwStr, func(r rune) bool {
+		return r == ',' || r == ' ' || r == '\t'
+	})
+	if len(keywords) == 0 {
+		jsonError(w, "keywords required", 400)
+		return
+	}
+
+	file, _, err := r.FormFile("file")
+	if err != nil {
+		jsonError(w, "file required", 400)
+		return
+	}
+	defer file.Close()
+
+	data, _ := io.ReadAll(file)
+	lines := strings.Split(strings.ReplaceAll(string(data), "\r\n", "\n"), "\n")
+
+	// split into chunks
+	chunkSize := c.config.MaxChunkLines
+	if chunkSize <= 0 {
+		chunkSize = 50000
+	}
+	var taskIDs []string
+	for i := 0; i < len(lines); i += chunkSize {
+		end := i + chunkSize
+		if end > len(lines) {
+			end = len(lines)
+		}
+		chunk := lines[i:end]
+		// skip empty chunks
+		nonEmpty := 0
+		for _, l := range chunk {
+			if strings.TrimSpace(l) != "" {
+				nonEmpty++
+			}
+		}
+		if nonEmpty == 0 {
+			continue
+		}
+
+		taskID := genToken()
+		c.mu.Lock()
+		c.tasks[taskID] = &Task{
+			ID:       taskID,
+			Keywords: keywords,
+			Chunk:    []byte(strings.Join(chunk, "\n")),
+			Lines:    nonEmpty,
+			Status:   "pending",
+		}
+		c.mu.Unlock()
+		taskIDs = append(taskIDs, taskID)
+	}
+
+	log.Printf("[coordinator] uploaded %d lines → %d chunks, keywords: %s",
+		len(lines), len(taskIDs), strings.Join(keywords, ", "))
+
+	jsonResp(w, map[string]interface{}{
+		"ok":        true,
+		"chunks":    len(taskIDs),
+		"total_lines": len(lines),
+		"keywords":  keywords,
+	})
+}
+
+// ── GET /api/status ──
+func (c *Coordinator) handleStatus(w http.ResponseWriter, r *http.Request) {
+	c.mu.RLock()
+	defer c.mu.RUnlock()
+
+	var nodes []NodeStatus
+	for _, n := range c.nodes {
+		status := n.Status
+		if time.Since(n.LastSeen) > time.Duration(c.config.HeartbeatInterval*3)*time.Second {
+			status = "dead"
+		}
+		nodes = append(nodes, NodeStatus{
+			ID: n.ID, Email: n.Email, Status: status,
+			LastSeen: n.LastSeen, Lines: n.Lines, Hits: n.Hits,
+		})
+	}
+
+	total, done := 0, 0
+	for _, t := range c.tasks {
+		total++
+		if t.Status == "done" {
+			done++
+		}
+	}
+
+	jsonResp(w, StatusResp{
+		OK:          true,
+		TotalTasks:  total,
+		DoneTasks:   done,
+		ActiveNodes: len(c.nodes),
+		Nodes:       nodes,
+	})
+}
+
+// ── GET /api/ping ──
+func (c *Coordinator) handlePing(w http.ResponseWriter, r *http.Request) {
+	jsonResp(w, map[string]interface{}{
+		"ok":    true,
+		"nodes": len(c.nodes),
+		"time":  time.Now().Format(time.RFC3339),
+	})
+}
+
+// ── background: monitor dead nodes ──
+func (c *Coordinator) monitorNodes() {
+	ticker := time.NewTicker(30 * time.Second)
+	for range ticker.C {
+		c.mu.Lock()
+		for token, n := range c.nodes {
+			if time.Since(n.LastSeen) > time.Duration(c.config.HeartbeatInterval*3)*time.Second {
+				if n.Status != "dead" {
+					log.Printf("[coordinator] node %s (%s) marked DEAD — last seen %s ago",
+						n.Email, token[:8], time.Since(n.LastSeen).Round(time.Second))
+					n.Status = "dead"
+				}
+			}
+		}
+		c.mu.Unlock()
+	}
+}
+
+// ── background: sync results to Google Drive ──
+func (c *Coordinator) syncToDrive() {
+	ticker := time.NewTicker(60 * time.Second)
+	for range ticker.C {
+		c.mu.RLock()
+		doneTasks := []*Task{}
+		for _, t := range c.tasks {
+			if t.Status == "done" && len(t.Results) > 0 {
+				doneTasks = append(doneTasks, t)
+			}
+		}
+		c.mu.RUnlock()
+
+		if len(doneTasks) == 0 {
+			continue
+		}
+
+		// write results to local temp dir
+		tmpDir := filepath.Join(os.TempDir(), "mesh_results")
+		os.MkdirAll(tmpDir, 0755)
+
+		for _, task := range doneTasks {
+			for _, kr := range task.Results {
+				if kr.Hits == 0 {
+					continue
+				}
+				fname := fmt.Sprintf("%s_%s.txt", sanitizeName(kr.Keyword), task.ID[:8])
+				fpath := filepath.Join(tmpDir, fname)
+				f, err := os.OpenFile(fpath, os.O_CREATE|os.O_WRONLY|os.O_APPEND, 0644)
+				if err != nil {
+					continue
+				}
+				for _, p := range kr.Payloads {
+					fmt.Fprintln(f, p)
+				}
+				f.Close()
+			}
+		}
+
+		// rclone copy to drive
+		remote := c.config.RcloneRemote + c.config.DriveSyncPath
+		cmd := exec.Command("rclone", "copy", tmpDir, remote, "--update")
+		if output, err := cmd.CombinedOutput(); err != nil {
+			log.Printf("[coordinator] rclone sync failed: %v — %s", err, string(output))
+		} else {
+			log.Printf("[coordinator] synced %d task results to %s", len(doneTasks), remote)
+		}
+
+		// clean synced tasks
+		c.mu.Lock()
+		for _, task := range doneTasks {
+			delete(c.tasks, task.ID)
+		}
+		c.mu.Unlock()
+	}
+}
+
+// ───────────────── helpers ─────────────────
+
+func genToken() string {
+	n, _ := rand.Int(rand.Reader, big.NewInt(1<<62))
+	return fmt.Sprintf("%x", n.Int64())
+}
+
+func jsonResp(w http.ResponseWriter, data interface{}) {
+	w.Header().Set("Content-Type", "application/json")
+	json.NewEncoder(w).Encode(data)
+}
+
+func jsonError(w http.ResponseWriter, msg string, code int) {
+	w.Header().Set("Content-Type", "application/json")
+	w.WriteHeader(code)
+	json.NewEncoder(w).Encode(map[string]string{"error": msg})
+}
+
+func sanitizeName(s string) string {
+	replacer := strings.NewReplacer(
+		"\\", "_", "/", "_", ":", "_", "*", "_",
+		"?", "_", "\"", "_", "<", "_", ">", "_",
+		"|", "_", " ", "_", "\t", "_",
+	)
+	return replacer.Replace(s)
+}

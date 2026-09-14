@@ -11,3 +11,5 @@ bot.log
 combo_results/
 *.exe
 __pycache__/
+mesh/nodes.json
+mesh/mesh.exe
