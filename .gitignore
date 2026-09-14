@@ -20,3 +20,8 @@ out/
 res_a/
 res_b/
 tail_probe.txt
+mesh/testdata/*.exe
+mesh/*.log
+mesh/creds_e2e.txt
+mesh/filter_e2e.txt
+mesh/mesh_results/

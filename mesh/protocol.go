@@ -48,12 +48,14 @@ type TaskRequest struct {
 }
 
 type TaskResp struct {
-	OK       bool     `json:"ok"`
-	TaskID   string   `json:"task_id"`
-	Keywords []string `json:"keywords"`
-	Data     string   `json:"data"` // raw combo chunk lines (newline-joined) sent inline
-	Lines    int      `json:"lines"`
-	Message  string   `json:"message"`
+	OK       bool          `json:"ok"`
+	TaskID   string        `json:"task_id"`
+	Mode     string        `json:"mode"` // "filter" | "check"
+	Keywords []string      `json:"keywords"`
+	Profile  *CheckProfile `json:"profile,omitempty"` // check mode only
+	Data     string        `json:"data"`              // raw combo chunk lines (newline-joined) sent inline
+	Lines    int           `json:"lines"`
+	Message  string        `json:"message"`
 }
 
 type ResultSubmit struct {

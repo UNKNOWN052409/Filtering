@@ -20,8 +20,10 @@ import (
 
 type Task struct {
 	ID       string
+	Mode     string // "filter" | "check"
 	Keywords []string
-	Chunk    []byte // raw combo lines for this chunk
+	Profile  *CheckProfile // check mode: endpoint/config for all workers
+	Chunk    []byte        // raw combo lines for this chunk
 	Lines    int
 	Status   string // "pending" | "assigned" | "done"
 	Assigned string // node token
@@ -174,7 +176,9 @@ func (c *Coordinator) handleTaskRequest(w http.ResponseWriter, r *http.Request) 
 			jsonResp(w, TaskResp{
 				OK:       true,
 				TaskID:   task.ID,
+				Mode:     task.Mode,
 				Keywords: task.Keywords,
+				Profile:  task.Profile,
 				Data:     string(task.Chunk), // deliver the actual combo lines
 				Lines:    task.Lines,
 				Message:  "processing",
@@ -245,6 +249,31 @@ func (c *Coordinator) handleUpload(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	// mode: filter (default) or check — check needs a JSON profile
+	mode := r.FormValue("mode")
+	if mode == "" {
+		mode = "filter"
+	}
+	if mode != "filter" && mode != "check" {
+		jsonError(w, "mode must be filter or check", 400)
+		return
+	}
+	var prof *CheckProfile
+	if mode == "check" {
+		profStr := r.FormValue("profile")
+		prof = &CheckProfile{}
+		if profStr != "" {
+			if err := json.Unmarshal([]byte(profStr), prof); err != nil {
+				jsonError(w, "bad profile json: "+err.Error(), 400)
+				return
+			}
+		}
+		if prof.Endpoint == "" {
+			jsonError(w, "check mode requires profile.endpoint", 400)
+			return
+		}
+	}
+
 	file, _, err := r.FormFile("file")
 	if err != nil {
 		jsonError(w, "file required", 400)
@@ -282,7 +311,9 @@ func (c *Coordinator) handleUpload(w http.ResponseWriter, r *http.Request) {
 		c.mu.Lock()
 		c.tasks[taskID] = &Task{
 			ID:       taskID,
+			Mode:     mode,
 			Keywords: keywords,
+			Profile:  prof,
 			Chunk:    []byte(strings.Join(chunk, "\n")),
 			Lines:    nonEmpty,
 			Status:   "pending",
@@ -291,14 +322,15 @@ func (c *Coordinator) handleUpload(w http.ResponseWriter, r *http.Request) {
 		taskIDs = append(taskIDs, taskID)
 	}
 
-	log.Printf("[coordinator] uploaded %d lines → %d chunks, keywords: %s",
-		len(lines), len(taskIDs), strings.Join(keywords, ", "))
+	log.Printf("[coordinator] uploaded %d lines → %d chunks (mode=%s), keywords: %s",
+		len(lines), len(taskIDs), mode, strings.Join(keywords, ", "))
 
 	jsonResp(w, map[string]interface{}{
-		"ok":        true,
-		"chunks":    len(taskIDs),
+		"ok":          true,
+		"chunks":      len(taskIDs),
 		"total_lines": len(lines),
-		"keywords":  keywords,
+		"mode":        mode,
+		"keywords":    keywords,
 	})
 }
 

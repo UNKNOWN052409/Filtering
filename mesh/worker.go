@@ -87,11 +87,15 @@ func (w *Worker) Run() {
 			continue
 		}
 
-		log.Printf("[worker] got task %s: %d lines, keywords: %s",
-			task.TaskID[:8], task.Lines, strings.Join(task.Keywords, ", "))
+		log.Printf("[worker] got task %s (mode=%s): %d lines, keywords: %s",
+			task.TaskID[:8], task.Mode, task.Lines, strings.Join(task.Keywords, ", "))
 
 		// process the task
-		w.processTask(task)
+		if task.Mode == "check" {
+			w.processCheckTask(task)
+		} else {
+			w.processTask(task)
+		}
 	}
 }
 
@@ -197,6 +201,78 @@ func (w *Worker) processTask(task *TaskResp) {
 
 	log.Printf("[worker] task %s done: %d lines, %d hits, %d malformed in %.1fs",
 		task.TaskID[:8], lines, totalHits, malformed, result.Duration)
+}
+
+// processCheckTask: replay each line against the profile endpoint (ported
+// from checker/validator.py) and sort into valid/invalid/errors buckets.
+func (w *Worker) processCheckTask(task *TaskResp) {
+	start := time.Now()
+	w.busy.Store(true)
+	defer w.busy.Store(false)
+
+	if task.Profile == nil || task.Profile.Endpoint == "" {
+		log.Printf("[worker] task %s check-mode but no profile — skipping", task.TaskID[:8])
+		return
+	}
+
+	buckets, validN, invalidN, errN := checkChunk(task.Data, task.Profile)
+
+	// local result files per bucket — survive submit/drive failures
+	os.MkdirAll(resultsDir, 0755)
+	var results []KeywordResult
+	bucketFiles := map[string]string{
+		bucketValid:   fmt.Sprintf("%s_valid_%s_node%d.txt", strings.Join(task.Keywords, "+"), task.TaskID[:8], w.nodeID),
+		bucketInvalid: fmt.Sprintf("%s_invalid_%s_node%d.txt", strings.Join(task.Keywords, "+"), task.TaskID[:8], w.nodeID),
+		bucketErrors:  fmt.Sprintf("%s_errors_%s_node%d.txt", strings.Join(task.Keywords, "+"), task.TaskID[:8], w.nodeID),
+	}
+	// safe joined name
+	for b := range bucketFiles {
+		bucketFiles[b] = sanitizeName(bucketFiles[b])
+	}
+	for _, bucket := range []string{bucketValid, bucketInvalid, bucketErrors} {
+		var rows []string
+		for _, r := range buckets {
+			if r.bucket == bucket {
+				rows = append(rows, r.out)
+			}
+		}
+		if len(rows) == 0 {
+			continue
+		}
+		fpath := filepath.Join(resultsDir, bucketFiles[bucket])
+		if f, err := os.OpenFile(fpath, os.O_CREATE|os.O_WRONLY|os.O_APPEND, 0644); err == nil {
+			for _, row := range rows {
+				fmt.Fprintln(f, row)
+			}
+			f.Close()
+		} else {
+			log.Printf("[worker] local write failed %s: %v", fpath, err)
+		}
+		results = append(results, KeywordResult{
+			Keyword:  bucket,
+			Lines:    int64(len(rows)),
+			Hits:     int64(len(rows)),
+			Payloads: rows,
+		})
+	}
+
+	result := ResultSubmit{
+		Token:     w.token,
+		TaskID:    task.TaskID,
+		Results:   results,
+		Lines:     int64(validN + invalidN + errN),
+		Hits:      int64(validN),
+		Malformed: 0,
+		Duration:  time.Since(start).Seconds(),
+	}
+	var resp ResultResp
+	if err := w.post("/api/result", result, &resp); err != nil {
+		log.Printf("[worker] result submit failed: %v", err)
+		return
+	}
+
+	log.Printf("[worker] check task %s done: valid %d | invalid %d | errors %d in %.1fs",
+		task.TaskID[:8], validN, invalidN, errN, result.Duration)
 }
 
 func (w *Worker) heartbeatLoop() {
