@@ -6,12 +6,10 @@ import (
 	"os"
 	"os/signal"
 	"path/filepath"
-	"runtime"
 	"strings"
 	"sync/atomic"
 	"syscall"
 	"time"
-	"unsafe"
 )
 
 const (
@@ -199,20 +197,6 @@ firstTick:
 }
 
 // ───────────────── helpers ─────────────────
-
-func enableVTWindows() {
-	if runtime.GOOS != "windows" {
-		return
-	}
-	kernel32 := syscall.NewLazyDLL("kernel32.dll")
-	setConsoleMode := kernel32.NewProc("SetConsoleMode")
-	getConsoleMode := kernel32.NewProc("GetConsoleMode")
-	consoleHandle, _ := syscall.GetStdHandle(syscall.STD_OUTPUT_HANDLE)
-	var mode uint32
-	getConsoleMode.Call(uintptr(consoleHandle), uintptr(unsafe.Pointer(&mode)))
-	const ENABLE_VIRTUAL_TERMINAL_PROCESSING = 0x0004
-	setConsoleMode.Call(uintptr(consoleHandle), uintptr(mode|ENABLE_VIRTUAL_TERMINAL_PROCESSING))
-}
 
 func promptLine(prompt string) string {
 	return promptLineReader(bufio.NewReader(os.Stdin), prompt)

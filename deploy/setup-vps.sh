@@ -37,12 +37,17 @@ usermod -aG fuse $USER 2>/dev/null || true
 echo "user_allow_other" >> /etc/fuse.conf
 
 # ── 5. Deploy mesh binary ──
+# BEFORE running this script, from your LOCAL machine:
+#   scp mesh/mesh_linux root@VPS_IP:/opt/mesh/mesh   (create dir first: ssh root@VPS_IP mkdir -p /opt/mesh)
 echo "[5/7] Deploying mesh binary..."
 MESH_DIR="/opt/mesh"
 mkdir -p $MESH_DIR
-cp mesh.exe $MESH_DIR/ 2>/dev/null || echo "  ⚠ mesh.exe not found — build locally first: cd mesh && go build -o mesh.exe ."
+if [ ! -f $MESH_DIR/mesh ]; then
+    echo "  ⚠ /opt/mesh/mesh not found — scp mesh_linux from local machine first (see comment above)"
+fi
 cp nodes.json $MESH_DIR/
 chmod 600 $MESH_DIR/nodes.json
+chmod +x $MESH_DIR/mesh 2>/dev/null || true
 
 # ── 6. Systemd service ──
 echo "[6/7] Creating systemd services..."
@@ -56,7 +61,7 @@ After=network.target
 [Service]
 Type=simple
 WorkingDirectory=/opt/mesh
-ExecStart=/opt/mesh/mesh.exe -mode coordinator -config /opt/mesh/nodes.json
+ExecStart=/opt/mesh/mesh -mode coordinator -config /opt/mesh/nodes.json
 Restart=always
 RestartSec=5
 Environment=HOME=/root
@@ -74,7 +79,7 @@ After=network.target
 [Service]
 Type=simple
 WorkingDirectory=/opt/mesh
-ExecStart=/opt/mesh/mesh.exe -mode worker -config /opt/mesh/nodes.json -coordinator http://127.0.0.1:7700
+ExecStart=/opt/mesh/mesh -mode worker -config /opt/mesh/nodes.json -coordinator http://127.0.0.1:7700
 Restart=always
 RestartSec=10
 Environment=NODE_ID=1

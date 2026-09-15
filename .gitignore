@@ -25,3 +25,6 @@ mesh/*.log
 mesh/creds_e2e.txt
 mesh/filter_e2e.txt
 mesh/mesh_results/
+mesh/mesh_linux
+mesh/mesh_linux_stripped
+combomaker/combomaker_linux
