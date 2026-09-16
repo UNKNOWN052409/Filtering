@@ -6,7 +6,6 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"strings"
-	"sync/atomic"
 	"testing"
 )
 
@@ -200,9 +199,7 @@ func TestDigAndTruthy(t *testing.T) {
 
 func TestConcurrentCheckSafety(t *testing.T) {
 	// hammer the pool: 200 lines through 30 threads, counts must add up
-	var hits atomic.Int64
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		hits.Add(1)
 		w.Header().Set("Content-Type", "application/json")
 		w.Write([]byte(`{"model":{"summary":{"userCountry":"IN"}}}`))
 	}))
@@ -215,6 +212,63 @@ func TestConcurrentCheckSafety(t *testing.T) {
 	}
 	_, valid, invalid, errs := checkChunk(sb.String(), prof)
 	if valid != 200 || invalid != 0 || errs != 0 {
-		t.Fatalf("concurrent run wrong: valid=%d invalid=%d errs=%d (server saw %d)", valid, invalid, errs, hits.Load())
+		t.Fatalf("concurrent run wrong: valid=%d invalid=%d errs=%d", valid, invalid, errs)
+	}
+}
+
+// ───────────────── real-deployment regression bugs ─────────────────
+
+func TestRateLimitAnd5xxAreErrorsNotInvalid(t *testing.T) {
+	// REAL BUG: 429 (rate limited) and 5xx (server hiccup) are TRANSIENT —
+	// lumping them into 'invalid' destroys good accounts as false negatives.
+	mux := http.NewServeMux()
+	mux.HandleFunc("/rate", func(w http.ResponseWriter, r *http.Request) { w.WriteHeader(429) })
+	mux.HandleFunc("/oops", func(w http.ResponseWriter, r *http.Request) { w.WriteHeader(503) })
+	srv := httptest.NewServer(mux)
+	defer srv.Close()
+
+	prof := &CheckProfile{Endpoint: srv.URL + "/rate", Probes: []string{"model.summary"}}
+	res := prof.checkOne(newCheckClient(prof.timeout()), "sid=x")
+	if res.bucket != bucketErrors {
+		t.Errorf("429 must land in errors (retryable), got bucket=%s", res.bucket)
+	}
+
+	prof5 := &CheckProfile{Endpoint: srv.URL + "/oops", Probes: []string{"model.summary"}}
+	res = prof5.checkOne(newCheckClient(prof5.timeout()), "sid=x")
+	if res.bucket != bucketErrors {
+		t.Errorf("503 must land in errors (retryable), got bucket=%s", res.bucket)
+	}
+}
+
+func TestLoginCookieSurvivesExpiresComma(t *testing.T) {
+	// REAL BUG: login responses carry 'Set-Cookie: sid=good; Expires=Wed, 21 Oct ...'
+	// — the comma inside the Expires date breaks naive split(", ") parsing, so
+	// the request sends 'sid=good; Expires=Wed' (corrupted cookie) instead of
+	// the clean pair. Stub here parses the Cookie header STRICTLY.
+	mux := http.NewServeMux()
+	mux.HandleFunc("/login", func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Set-Cookie", "sid=good; Expires=Wed, 21 Oct 2026 07:28:00 GMT; Path=/")
+		w.WriteHeader(200)
+		w.Write([]byte(`{"ok":true}`))
+	})
+	mux.HandleFunc("/api", func(w http.ResponseWriter, r *http.Request) {
+		if r.Header.Get("Cookie") != "sid=good" { // strict: attributes must NOT leak
+			w.WriteHeader(401)
+			return
+		}
+		w.Header().Set("Content-Type", "application/json")
+		w.Write([]byte(`{"model":{"summary":{"userCountry":"IN"}}}`))
+	})
+	srv := httptest.NewServer(mux)
+	defer srv.Close()
+
+	prof := &CheckProfile{
+		Endpoint:      srv.URL + "/api",
+		LoginEndpoint: srv.URL + "/login",
+		Probes:        []string{"model.summary"},
+	}
+	res := prof.checkOne(newCheckClient(prof.timeout()), "good:secret")
+	if res.bucket != bucketValid {
+		t.Errorf("expires-comma login flow must be valid, got %s (out=%s)", res.bucket, res.out)
 	}
 }

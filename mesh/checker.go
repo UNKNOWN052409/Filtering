@@ -206,6 +206,10 @@ func (p *CheckProfile) checkOne(client *http.Client, item string) checkResult {
 	switch {
 	case r.StatusCode >= 300 && r.StatusCode < 400:
 		return checkResult{bucketInvalid, item}
+	case r.StatusCode == 429 || r.StatusCode >= 500:
+		// TRANSIENT: rate limit / server hiccup — retryable, must NOT be
+		// counted as invalid or good accounts die as false negatives
+		return checkResult{bucketErrors, item}
 	case r.StatusCode == 401 || r.StatusCode == 403:
 		return checkResult{bucketInvalid, item}
 	case r.StatusCode != 200:

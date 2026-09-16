@@ -118,9 +118,9 @@ func TestRunEndToEnd(t *testing.T) {
 		"www.netflix.com:mike:pass2",
 		"https://spotify.com:sara:pass3",
 		"accounts.netflix.com:u:pass4",
-		"malformed_line",       // no colons
-		"only:one",             // 1 colon
-		"",                     // empty
+		"malformed_line", // no colons
+		"only:one",       // 1 colon
+		"",               // empty
 	}
 	inputPath := filepath.Join(tmpDir, "combos.txt")
 	os.WriteFile(inputPath, []byte(strings.Join(lines, "\n")), 0644)
@@ -202,6 +202,40 @@ func TestRunTailNoNewline(t *testing.T) {
 	}
 	if atomicLoadInt64(&stats.Hits) != 2 {
 		t.Errorf("tail Hits = %d, want 2", atomicLoadInt64(&stats.Hits))
+	}
+}
+
+// ───────────────── malformed vs non-matching (regression) ─────────────────
+
+// Regression: valid lines that match no keyword were counted as Malformed
+// because parseLine collapsed "unparseable" and "no match" into one false.
+func TestRunValidNonMatchingNotMalformed(t *testing.T) {
+	tmpDir := t.TempDir()
+	outDir := filepath.Join(tmpDir, "out")
+	os.MkdirAll(outDir, 0755)
+
+	lines := []string{
+		"https://netflix.com:a:b",         // match
+		"https://notnetflix.com:c:d",      // well-formed, no match — NOT malformed
+		"https://netflix.com.evil.io:e:f", // well-formed, no match — NOT malformed
+		"bad_line_no_colons",              // malformed
+		"only:one",                        // malformed
+	}
+	inputPath := filepath.Join(tmpDir, "combos.txt")
+	os.WriteFile(inputPath, []byte(strings.Join(lines, "\n")), 0644)
+
+	done := make(chan struct{})
+	stats := Run(inputPath, []string{"netflix.com"}, outDir, done)
+	<-done
+
+	if atomicLoadInt64(&stats.Lines) != 5 {
+		t.Errorf("Lines = %d, want 5", atomicLoadInt64(&stats.Lines))
+	}
+	if atomicLoadInt64(&stats.Hits) != 1 {
+		t.Errorf("Hits = %d, want 1", atomicLoadInt64(&stats.Hits))
+	}
+	if got := atomicLoadInt64(&stats.Malformed); got != 2 {
+		t.Errorf("Malformed = %d, want 2 (only unparseable lines)", got)
 	}
 }
 

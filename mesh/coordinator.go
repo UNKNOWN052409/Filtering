@@ -19,15 +19,16 @@ import (
 // ───────────────── Coordinator ─────────────────
 
 type Task struct {
-	ID       string
-	Mode     string // "filter" | "check"
-	Keywords []string
-	Profile  *CheckProfile // check mode: endpoint/config for all workers
-	Chunk    []byte        // raw combo lines for this chunk
-	Lines    int
-	Status   string // "pending" | "assigned" | "done"
-	Assigned string // node token
-	Results  []KeywordResult
+	ID         string
+	Mode       string // "filter" | "check"
+	Keywords   []string
+	Profile    *CheckProfile // check mode: endpoint/config for all workers
+	Chunk      []byte        // raw combo lines for this chunk
+	Lines      int
+	Status     string // "pending" | "assigned" | "done"
+	Assigned   string // node token
+	AssignedAt *time.Time // when it went assigned (drives stale requeue)
+	Results    []KeywordResult
 }
 
 type Coordinator struct {
@@ -75,6 +76,7 @@ func (c *Coordinator) Run(addr string) {
 	// start background jobs
 	go c.monitorNodes()
 	go c.syncToDrive()
+	go c.reapAssigned()
 
 	log.Printf("[coordinator] listening on %s", addr)
 	log.Fatal(http.ListenAndServe(addr, mux))
@@ -168,6 +170,8 @@ func (c *Coordinator) handleTaskRequest(w http.ResponseWriter, r *http.Request) 
 		if task.Status == "pending" {
 			task.Status = "assigned"
 			task.Assigned = token
+			now := time.Now()
+			task.AssignedAt = &now
 			// update node status
 			if n, ok := c.nodes[token]; ok {
 				n.Status = "busy"
@@ -377,6 +381,37 @@ func (c *Coordinator) handlePing(w http.ResponseWriter, r *http.Request) {
 		"nodes": len(c.nodes),
 		"time":  time.Now().Format(time.RFC3339),
 	})
+}
+
+// ── background: requeue tasks whose worker vanished mid-run ──
+// A crashed worker leaves the task Status=assigned forever; without this the
+// task never completes and total counts stall. task_timeout_sec (default 5m).
+func (c *Coordinator) reapAssigned() {
+	ticker := time.NewTicker(15 * time.Second)
+	for range ticker.C {
+		c.requeueStale()
+	}
+}
+
+func (c *Coordinator) requeueStale() {
+	timeout := time.Duration(c.config.TaskTimeout) * time.Second
+	if timeout <= 0 {
+		timeout = 5 * time.Minute
+	}
+	c.mu.Lock()
+	for _, t := range c.tasks {
+		if t.Status == "assigned" && t.AssignedAt != nil && time.Since(*t.AssignedAt) > timeout {
+			t.Status = "pending"
+			t.Assigned = ""
+			t.AssignedAt = nil
+			short := t.ID
+			if len(short) > 8 {
+				short = short[:8]
+			}
+			log.Printf("[coordinator] task %s stale — requeued", short)
+		}
+	}
+	c.mu.Unlock()
 }
 
 // ── background: monitor dead nodes ──

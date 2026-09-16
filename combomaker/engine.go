@@ -205,9 +205,11 @@ func Run(inputPath string, keywords []string, outDir string, done chan struct{})
 		}
 
 		atomic.AddInt64(&stats.Lines, 1)
-		hit := parseLine(trimmed, kwLower, kwSanitized, stats, getFile)
+		parsed, _ := parseLine(trimmed, kwLower, kwSanitized, stats, getFile)
 
-		if !hit {
+		if !parsed {
+			// malformed = unparseable only; a well-formed line that just
+			// doesn't match any keyword is neither malformed nor a hit
 			atomic.AddInt64(&stats.Malformed, 1)
 		}
 
@@ -219,20 +221,19 @@ func Run(inputPath string, keywords []string, outDir string, done chan struct{})
 	return stats
 }
 
-func parseLine(line []byte, kwLower, kwSanitized []string, stats *Stats, getFile func(string) *fileEntry) bool {
+func parseLine(line []byte, kwLower, kwSanitized []string, stats *Stats, getFile func(string) *fileEntry) (parsed, hit bool) {
 	url, login, pwd := splitCombo(line)
 	if len(url) == 0 || len(login) == 0 || len(pwd) == 0 {
-		return false
+		return false, false
 	}
 
 	domain := extractDomain(url)
 	if len(domain) == 0 || !strings.Contains(domain, ".") {
-		return false
+		return false, false
 	}
 
 	payload := string(login) + ":" + string(pwd)
 
-	hitAny := false
 	for i, kw := range kwLower {
 		if domainMatches(domain, kw) {
 			if fe := getFile(kwSanitized[i]); fe != nil {
@@ -240,14 +241,14 @@ func parseLine(line []byte, kwLower, kwSanitized []string, stats *Stats, getFile
 				fe.lines++
 			}
 			stats.KwHits[i].Add(1)
-			hitAny = true
+			hit = true
 		}
 	}
 
-	if hitAny {
+	if hit {
 		stats.Hits++
 	}
-	return hitAny
+	return true, hit
 }
 
 func splitCombo(line []byte) (url, login, pwd []byte) {

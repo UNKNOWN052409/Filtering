@@ -154,6 +154,11 @@ def check_one(raw, idx, cfg, login_mode):
         return (idx, {"valid": False, "reason": "redirect-to-login", "http": status})
     if status in (401, 403):
         return (idx, {"valid": False, "reason": f"auth:{status}", "http": status})
+    if status == 429 or status >= 500:
+        # TRANSIENT: rate limit / server hiccup — retryable. Bucketing these as
+        # invalid kills good accounts as false negatives on a slow endpoint.
+        return (idx, {"valid": False, "reason": f"http:{status}", "http": status,
+                      "retryable": True})
     if status != 200:
         return (idx, {"valid": False, "reason": f"http:{status}", "http": status})
 
@@ -281,7 +286,7 @@ def main():
             entry = {"index": idx, "line": line, "verdict": "valid",
                      "region": res.get("region"), "plan": res.get("plan"),
                      "status": res.get("status")}
-        elif (res.get("reason") or "").startswith("net:"):
+        elif (res.get("reason") or "").startswith("net:") or res.get("retryable"):
             errors.append(line)
             entry = {"index": idx, "line": line, "verdict": "error",
                      "reason": res.get("reason")}
