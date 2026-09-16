@@ -110,14 +110,12 @@ func (p *CheckProfile) headers(cookie string) map[string]string {
 	if ua == "" {
 		ua = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0 Safari/537.36"
 	}
-	ref := p.Referer
-	if ref == "" {
-		ref = "https://www.example.net/"
-	}
 	h := map[string]string{
 		"User-Agent": ua,
 		"Accept":     "application/json, text/plain, */*",
-		"Referer":    ref,
+	}
+	if p.Referer != "" {
+		h["Referer"] = p.Referer
 	}
 	if p.BuildID != "" {
 		h["X-Netflix-BuildId"] = p.BuildID

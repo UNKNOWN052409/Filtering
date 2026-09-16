@@ -55,6 +55,9 @@ except ImportError:
 
 CONFIG_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "config.json")
 
+DEFAULT_UA = ("Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
+              "(KHTML, like Gecko) Chrome/120.0 Safari/537.36")
+
 
 def load_config():
     if not os.path.exists(CONFIG_FILE):
@@ -81,13 +84,13 @@ def login_for_cookie(creds, cfg):
         cfg.get("pass_field", "password"): pwd,
     }
     headers = {
-        "User-Agent": cfg.get("ua",
-            "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
-            "(KHTML, like Gecko) Chrome/120.0 Safari/537.36"),
+        "User-Agent": cfg.get("ua", DEFAULT_UA),
         "Content-Type": "application/json",
-        "Referer": cfg.get("referer", "https://www.example.net/"),
-        "Origin": cfg.get("origin", "https://www.example.net"),
     }
+    if cfg.get("referer"):
+        headers["Referer"] = cfg["referer"]
+    if cfg.get("origin"):
+        headers["Origin"] = cfg["origin"]
     try:
         r = requests.post(url, json=body, headers=headers, timeout=int(cfg.get("timeout", 15)))
     except requests.RequestException:
@@ -126,13 +129,12 @@ def check_one(raw, idx, cfg, login_mode):
     api_key = cfg.get("api_key", "")
 
     headers = {
-        "User-Agent": cfg.get("ua",
-            "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
-            "(KHTML, like Gecko) Chrome/120.0 Safari/537.36"),
+        "User-Agent": cfg.get("ua", DEFAULT_UA),
         "Accept": "application/json, text/plain, */*",
-        "Referer": cfg.get("referer", "https://www.example.net/"),
         "Cookie": cookie,
     }
+    if cfg.get("referer"):
+        headers["Referer"] = cfg["referer"]
     if build_id:
         headers["X-Netflix-BuildId"] = build_id
     if api_key:
