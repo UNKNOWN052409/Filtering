@@ -37,8 +37,16 @@ func main() {
 	}
 	inputPath = strings.Trim(inputPath, "\"' ")
 	inputPath = filepath.Clean(inputPath)
-	if _, err := os.Stat(inputPath); os.IsNotExist(err) {
+	// a successful Stat does not guarantee a successful Open: a directory, a
+	// permission error, or a file removed in between still fails. Catch what we
+	// can see here so we exit with a message; Run's own open-error path (which
+	// closes done exactly once, via its defer) covers the remaining race.
+	if fi, err := os.Stat(inputPath); os.IsNotExist(err) {
 		die(fmt.Sprintf("file not found: %s", inputPath))
+	} else if err != nil {
+		die(fmt.Sprintf("cannot stat %s: %v", inputPath, err))
+	} else if fi.IsDir() {
+		die(fmt.Sprintf("not a regular file: %s", inputPath))
 	}
 	if !strings.HasSuffix(strings.ToLower(inputPath), ".txt") {
 		die("only .txt files accepted")
@@ -101,9 +109,13 @@ func main() {
 	done := make(chan struct{})
 	t0 := time.Now()
 
-	var stats *Stats
+	// live holds the *Stats the moment Run allocates it, so the progress ticker
+	// reads it without racing on a variable the run goroutine writes. The final
+	// value comes back over resCh, so main never touches the goroutine's local.
+	resCh := make(chan *Stats, 1)
+	var live atomic.Pointer[Stats]
 	go func() {
-		stats = Run(inputPath, keywords, outDir, done)
+		resCh <- Run(inputPath, keywords, outDir, done, func(s *Stats) { live.Store(s) })
 	}()
 
 	// ── live progress ──
@@ -111,42 +123,60 @@ func main() {
 	defer ticker.Stop()
 	quitCh := make(chan bool, 1)
 
+	// keep watching stdin for the whole run — a single ReadByte would swallow
+	// one non-'q' byte and leave the quit key dead for the rest of the session
 	go func() {
-		b, _ := stdinReader.ReadByte()
-		if b == 'q' || b == 'Q' || b == 3 {
-			quitCh <- true
+		for {
+			b, err := stdinReader.ReadByte()
+			if err != nil {
+				return
+			}
+			if b == 'q' || b == 'Q' || b == 3 {
+				select {
+					case quitCh <- true:
+					default:
+				}
+				return
+			}
 		}
 	}()
+
+	// written only by this goroutine, from the value Run hands back
+	var stats *Stats
 
 firstTick:
 	for {
 		select {
-		case <-ticker.C:
-			if stats == nil {
-				continue
-			}
-			elapsed := time.Since(t0).Seconds()
-			if elapsed < 0.1 {
-				continue
-			}
-			lines := atomic.LoadInt64(&stats.Lines)
-			hits := atomic.LoadInt64(&stats.Hits)
-			mal := atomic.LoadInt64(&stats.Malformed)
-			speed := float64(lines) / elapsed
-			pct := 0.0
-			if sz > 0 {
-				pct = float64(atomic.LoadInt64(&stats.BytesRead)) / float64(sz) * 100
-				if pct > 100 {
-					pct = 100
+			case <-ticker.C:
+				s := live.Load()
+				if s == nil {
+					continue
 				}
-			}
-			bar := progressBar(pct/100, 25)
+				elapsed := time.Since(t0).Seconds()
+				if elapsed < 0.1 {
+					continue
+				}
+				lines := atomic.LoadInt64(&s.Lines)
+				hits := atomic.LoadInt64(&s.Hits)
+				mal := atomic.LoadInt64(&s.Malformed)
+				speed := float64(lines) / elapsed
+				pct := 0.0
+				if sz > 0 {
+					pct = float64(atomic.LoadInt64(&s.BytesRead)) / float64(sz) * 100
+					if pct > 100 {
+						pct = 100
+					}
+				}
+				bar := progressBar(pct/100, 25)
 
-			fmt.Fprintf(os.Stderr, "\r  %s %5.1f%%  lines: %s  %s/s  hits: %s  malformed: %s  t: %s          ",
-				bar, pct, fmtN(lines), fmtN(int64(speed)), fmtN(hits), fmtN(mal), fmtDuration(elapsed))
+				fmt.Fprintf(os.Stderr, "\r  %s %5.1f%%  lines: %s  %s/s  hits: %s  malformed: %s  t: %s          ",
+					bar, pct, fmtN(lines), fmtN(int64(speed)), fmtN(hits), fmtN(mal), fmtDuration(elapsed))
 
-		case <-done:
-			break firstTick
+			case <-done:
+				// Run closes done immediately before returning, so the buffered
+				// send is already on its way — this receive cannot block for long
+				stats = <-resCh
+				break firstTick
 
 		case <-quitCh:
 			fmt.Println("\n\n⚠ stopped by user — partial results saved")
@@ -214,6 +244,10 @@ func die(msg string) {
 }
 
 func progressBar(frac float64, width int) string {
+	// a negative frac makes filled negative and strings.Repeat panics
+	if frac < 0 {
+		frac = 0
+	}
 	filled := int(frac * float64(width))
 	if filled > width {
 		filled = width

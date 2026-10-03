@@ -213,8 +213,17 @@ class Engine(threading.Thread):
         self.stop = False
         self.write_failed = False
         self.files, self.counts = {}, {}
+        # stats() is called from the poll thread while this thread mutates
+        # counts; iterating it unsynchronised raised
+        # "dictionary changed size during iteration" and stalled the poller.
+        self.lock = threading.Lock()
         self.lines = self.hits = self.bad = self.seen_dup = 0
         self.t0 = None
+
+    def snapshot(self):
+        """Consistent copy of counts for readers on other threads."""
+        with self.lock:
+            return dict(self.counts)
 
     def w(self, name, payload):
         if self.write_failed:                     # disk full — stop hammering it
@@ -231,7 +240,8 @@ class Engine(threading.Thread):
             else:
                 self.files[path] = self.files.pop(path)   # touch -> most-recent
             h.write(payload + "\n")
-            self.counts[name] = self.counts.get(name, 0) + 1
+            with self.lock:
+                self.counts[name] = self.counts.get(name, 0) + 1
             self.hits += 1
         except OSError:
             self.write_failed = True                 # surface "disk full" not a crash
@@ -239,26 +249,47 @@ class Engine(threading.Thread):
     def run(self):
         self.t0 = time.time()
         seen = set()
-        with open(self.src, encoding="utf-8", errors="replace") as f:
-            for raw in f:
-                if self.stop:
-                    break
-                raw = raw.rstrip("\r\n")
-                if not raw:
-                    continue
-                c = classify(raw)
-                if c is None:
-                    self.bad += 1
-                    continue
-                self.lines += 1
-                if raw in seen:
-                    self.seen_dup += 1
-                    continue
-                seen.add(raw)
-                self.route(c)
-        for h in self.files.values():
-            h.close()
-        self.finish()
+        failed = None
+        # try/finally: if open(self.src) (or anything in the loop) raised, the
+        # thread used to die before the handle cleanup and before finish(), so
+        # descriptors leaked AND the chat stayed "busy" forever -- the bot then
+        # refused every further upload until the user typed /cancel.
+        try:
+            with open(self.src, encoding="utf-8", errors="replace") as f:
+                for raw in f:
+                    if self.stop:
+                        break
+                    raw = raw.rstrip("\r\n")
+                    if not raw:
+                        continue
+                    c = classify(raw)
+                    if c is None:
+                        self.bad += 1
+                        continue
+                    self.lines += 1
+                    if raw in seen:
+                        self.seen_dup += 1
+                        continue
+                    seen.add(raw)
+                    self.route(c)
+        except Exception as e:
+            failed = f"{type(e).__name__}: {str(e)[:120]}"
+            log.error("engine %s failed: %s", self.run_id, failed)
+        finally:
+            for h in list(self.files.values()):
+                try:
+                    h.close()
+                except OSError:
+                    pass
+            self.files.clear()
+            if failed:
+                try:
+                    self.bot.edit(self.chat, f"⚠️ run failed — {failed}"
+                                          f"\nMade by @torbug ⚡")
+                finally:
+                    self.bot.done(self.chat)     # never strand "busy"
+            else:
+                self.finish()
 
     def route(self, c):
         if c["kind"] == "url":
@@ -281,30 +312,32 @@ class Engine(threading.Thread):
     def stats(self):
         el = time.time() - self.t0 if self.t0 else 0
         sp = self.lines / el if el > 0 else 0
+        counts = self.snapshot()
         rows = "".join(f"\n<code>{k[:28]:<28}</code>{v:>9,}" for k, v in
-                       sorted(self.counts.items(), key=lambda x: -x[1])[:8])
+                       sorted(counts.items(), key=lambda x: -x[1])[:8])
         return (f"⚡ <b>torbugbot</b> — filtering\n"
                 f"lines: {self.lines:,} | {sp:,.0f}/s | elapsed {int(el)}s\n"
-                f"hits: {sum(self.counts.values()):,} | dup: {self.seen_dup:,} | bad: {self.bad:,}"
+                f"hits: {sum(counts.values()):,} | dup: {self.seen_dup:,} | bad: {self.bad:,}"
                 f"{rows}")
 
     def finish(self):
         el = time.time() - self.t0
-        total = sum(self.counts.values())
+        counts = self.snapshot()
+        total = sum(counts.values())
         rows = "".join(f"\n<code>{k[:28]:<28}</code>{v:>9,}" for k, v in
-                       sorted(self.counts.items(), key=lambda x: -x[1])[:15])
+                       sorted(counts.items(), key=lambda x: -x[1])[:15])
         note = " ⚠️ disk-full — output truncated" if self.write_failed else ""
         msg = (f"✅ <b>DONE</b> — {el:.1f}s | {self.lines:,} lines | {total:,} sorted\n"
-               f"files: {len(self.counts)}{rows}{note}")
+               f"files: {len(counts)}{rows}{note}")
         self.bot.edit(self.chat, msg)
         # ship files — ONLY from THIS run's dir, never a stale one
-        if not self.counts:
+        if not counts:
             self.bot.edit(self.chat, "⚠️ kuch match nahi hua — input format check karo.\n"
                                    "url:login:pass | email:pass | phone:pass | login:pass")
             self.bot.done(self.chat)
             return
         paths = [os.path.join(self.out, f"{safe_name(n)}_{self.run_id}.txt")
-                 for n in self.counts]
+                 for n in counts]
         paths = [p for p in paths if os.path.exists(p)]
         try:
             if len(paths) > 12:

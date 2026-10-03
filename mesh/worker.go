@@ -64,7 +64,7 @@ func (w *Worker) Run() {
 		log.Fatalf("[worker] register failed: %v — %s", err, regResp.Message)
 	}
 	w.token = regResp.Token
-	log.Printf("[worker] registered as node %d (%s) — token %s", w.nodeID, w.email, w.token[:8])
+	log.Printf("[worker] registered as node %d (%s) — token %s", w.nodeID, w.email, shortID(w.token, 8))
 
 	// start heartbeat
 	go w.heartbeatLoop()
@@ -88,7 +88,7 @@ func (w *Worker) Run() {
 		}
 
 		log.Printf("[worker] got task %s (mode=%s): %d lines, keywords: %s",
-			task.TaskID[:8], task.Mode, task.Lines, strings.Join(task.Keywords, ", "))
+			shortID(task.TaskID, 8), task.Mode, task.Lines, strings.Join(task.Keywords, ", "))
 
 		// process the task
 		if task.Mode == "check" {
@@ -117,7 +117,7 @@ func (w *Worker) processTask(task *TaskResp) {
 	defer w.busy.Store(false)
 
 	if task.Data == "" {
-		log.Printf("[worker] task %s has no chunk data — skipping", task.TaskID[:8])
+		log.Printf("[worker] task %s has no chunk data — skipping", shortID(task.TaskID, 8))
 		return
 	}
 
@@ -166,7 +166,7 @@ func (w *Worker) processTask(task *TaskResp) {
 			continue
 		}
 		fpath := filepath.Join(resultsDir,
-			fmt.Sprintf("%s_%s_node%d.txt", kwSan[i], task.TaskID[:8], w.nodeID))
+			fmt.Sprintf("%s_%s_node%d.txt", kwSan[i], shortID(task.TaskID, 8), w.nodeID))
 		if f, err := os.OpenFile(fpath, os.O_CREATE|os.O_WRONLY|os.O_APPEND, 0644); err == nil {
 			for _, p := range payloads[i] {
 				fmt.Fprintln(f, p)
@@ -200,7 +200,7 @@ func (w *Worker) processTask(task *TaskResp) {
 	}
 
 	log.Printf("[worker] task %s done: %d lines, %d hits, %d malformed in %.1fs",
-		task.TaskID[:8], lines, totalHits, malformed, result.Duration)
+		shortID(task.TaskID, 8), lines, totalHits, malformed, result.Duration)
 }
 
 // processCheckTask: replay each line against the profile endpoint (ported
@@ -211,7 +211,7 @@ func (w *Worker) processCheckTask(task *TaskResp) {
 	defer w.busy.Store(false)
 
 	if task.Profile == nil || task.Profile.Endpoint == "" {
-		log.Printf("[worker] task %s check-mode but no profile — skipping", task.TaskID[:8])
+		log.Printf("[worker] task %s check-mode but no profile — skipping", shortID(task.TaskID, 8))
 		return
 	}
 
@@ -221,9 +221,9 @@ func (w *Worker) processCheckTask(task *TaskResp) {
 	os.MkdirAll(resultsDir, 0755)
 	var results []KeywordResult
 	bucketFiles := map[string]string{
-		bucketValid:   fmt.Sprintf("%s_valid_%s_node%d.txt", strings.Join(task.Keywords, "+"), task.TaskID[:8], w.nodeID),
-		bucketInvalid: fmt.Sprintf("%s_invalid_%s_node%d.txt", strings.Join(task.Keywords, "+"), task.TaskID[:8], w.nodeID),
-		bucketErrors:  fmt.Sprintf("%s_errors_%s_node%d.txt", strings.Join(task.Keywords, "+"), task.TaskID[:8], w.nodeID),
+		bucketValid:   fmt.Sprintf("%s_valid_%s_node%d.txt", strings.Join(task.Keywords, "+"), shortID(task.TaskID, 8), w.nodeID),
+		bucketInvalid: fmt.Sprintf("%s_invalid_%s_node%d.txt", strings.Join(task.Keywords, "+"), shortID(task.TaskID, 8), w.nodeID),
+		bucketErrors:  fmt.Sprintf("%s_errors_%s_node%d.txt", strings.Join(task.Keywords, "+"), shortID(task.TaskID, 8), w.nodeID),
 	}
 	// safe joined name
 	for b := range bucketFiles {
@@ -272,11 +272,17 @@ func (w *Worker) processCheckTask(task *TaskResp) {
 	}
 
 	log.Printf("[worker] check task %s done: valid %d | invalid %d | errors %d in %.1fs",
-		task.TaskID[:8], validN, invalidN, errN, result.Duration)
+		shortID(task.TaskID, 8), validN, invalidN, errN, result.Duration)
 }
 
 func (w *Worker) heartbeatLoop() {
-	ticker := time.NewTicker(time.Duration(w.config.HeartbeatInterval) * time.Second)
+	// time.NewTicker panics on a non-positive duration, and the interval comes
+	// straight from nodes.json — clamp it before building the ticker
+	interval := w.config.HeartbeatInterval
+	if interval <= 0 {
+		interval = 30
+	}
+	ticker := time.NewTicker(time.Duration(interval) * time.Second)
 	for range ticker.C {
 		status := "idle"
 		if w.busy.Load() {
@@ -299,9 +305,13 @@ func (w *Worker) sendHeartbeat(status string, lines, hits int64) {
 
 // ───────────────── HTTP helpers ─────────────────
 
+// meshClient bounds every coordinator round-trip. http.DefaultClient carries
+// no timeout, so a stalled coordinator would block the worker forever.
+var meshClient = &http.Client{Timeout: 30 * time.Second}
+
 func (w *Worker) post(path string, data interface{}, result interface{}) error {
 	body, _ := json.Marshal(data)
-	resp, err := http.Post(w.coordinatorURL+path, "application/json", bytes.NewReader(body))
+	resp, err := meshClient.Post(w.coordinatorURL+path, "application/json", bytes.NewReader(body))
 	if err != nil {
 		return err
 	}
@@ -310,7 +320,7 @@ func (w *Worker) post(path string, data interface{}, result interface{}) error {
 }
 
 func (w *Worker) get(path string, result interface{}) error {
-	resp, err := http.Get(w.coordinatorURL + path)
+	resp, err := meshClient.Get(w.coordinatorURL + path)
 	if err != nil {
 		return err
 	}

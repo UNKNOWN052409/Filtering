@@ -1,0 +1,10 @@
+https://www.netflix.com:alice@example.com:Passw0rd!23
+https://accounts.spotify.com:bob.smith@gmail.com:hunter2xyz
+www.netflix.com:carol_99:qwerty
+https://www.amazon.com:dave@yahoo.com:Prime12345
+discord.com:eve@proton.me:discordpass
+https://www.netflix.com:alice@example.com:Passw0rd!23
+https://hbomax.com:frank:maxpass99
+https://www.crunchyroll.com:grace@mail.com:crunchy2024
+https://random-unknown-site.io:henry:whatever
+https://www.netflix.com:ivan@test.com:netflix2024

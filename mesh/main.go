@@ -22,7 +22,11 @@ func main() {
 	}
 	defer f.Close()
 	var cfg MeshConfig
-	json.NewDecoder(f).Decode(&cfg)
+	// an unchecked decode failure leaves cfg zero-valued, which is what produces
+	// a 0s heartbeat interval, a 0s task timeout and an unbounded chunk size
+	if err := json.NewDecoder(f).Decode(&cfg); err != nil {
+		log.Fatalf("config %s: %v", *configPath, err)
+	}
 
 	if *port != 7700 {
 		cfg.CoordinatorPort = *port

@@ -278,10 +278,12 @@ func checkChunk(data string, prof *CheckProfile) (results []checkResult, valid, 
 	sem := make(chan struct{}, prof.threads())
 	var wg sync.WaitGroup
 	for i := range lines {
+		// take the slot *before* spawning: acquiring inside the goroutine spawns
+		// one goroutine per line (50k+ for a default chunk) and only then blocks
+		sem <- struct{}{}
 		wg.Add(1)
 		go func(i int) {
 			defer wg.Done()
-			sem <- struct{}{}
 			defer func() { <-sem }()
 			results[i] = prof.checkOne(client, lines[i])
 		}(i)

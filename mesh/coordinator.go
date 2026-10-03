@@ -2,6 +2,7 @@ package main
 
 import (
 	"crypto/rand"
+	"crypto/subtle"
 	"encoding/json"
 	"fmt"
 	"io"
@@ -15,6 +16,10 @@ import (
 	"sync"
 	"time"
 )
+
+// maxRequestBody caps JSON request bodies on the unauthenticated endpoints so
+// a caller cannot make the coordinator buffer an arbitrary amount of memory.
+const maxRequestBody = 8 << 20
 
 // ───────────────── Coordinator ─────────────────
 
@@ -54,6 +59,11 @@ type NodeInfo struct {
 }
 
 func NewCoordinator(cfg MeshConfig) *Coordinator {
+	// a zero interval makes "HeartbeatInterval*3" compare as 0s, so every node
+	// reads as dead the instant it is registered — normalise it here, once
+	if cfg.HeartbeatInterval <= 0 {
+		cfg.HeartbeatInterval = 30
+	}
 	return &Coordinator{
 		config:       cfg,
 		tasks:        make(map[string]*Task),
@@ -79,11 +89,21 @@ func (c *Coordinator) Run(addr string) {
 	go c.reapAssigned()
 
 	log.Printf("[coordinator] listening on %s", addr)
-	log.Fatal(http.ListenAndServe(addr, mux))
+	// http.ListenAndServe uses DefaultServer, which sets none of these: a slow
+	// or stalled client can hold a connection open indefinitely
+	srv := &http.Server{
+		Addr:              addr,
+		Handler:           mux,
+		ReadHeaderTimeout: 10 * time.Second,
+		WriteTimeout:      30 * time.Second,
+		IdleTimeout:       60 * time.Second,
+	}
+	log.Fatal(srv.ListenAndServe())
 }
 
 // ── POST /api/register ──
 func (c *Coordinator) handleRegister(w http.ResponseWriter, r *http.Request) {
+	r.Body = http.MaxBytesReader(w, r.Body, maxRequestBody)
 	if r.Method != "POST" {
 		http.Error(w, "POST only", 405)
 		return
@@ -97,7 +117,7 @@ func (c *Coordinator) handleRegister(w http.ResponseWriter, r *http.Request) {
 	// validate credentials against config
 	valid := false
 	for _, n := range c.config.Nodes {
-		if n.Email == req.Email && n.Password == req.Password {
+		if n.Email == req.Email && subtle.ConstantTimeCompare([]byte(n.Password), []byte(req.Password)) == 1 {
 			valid = true
 			break
 		}
@@ -125,12 +145,13 @@ func (c *Coordinator) handleRegister(w http.ResponseWriter, r *http.Request) {
 	}
 	c.mu.Unlock()
 
-	log.Printf("[coordinator] node registered: %s (%s) — token %s", req.Email, req.Hostname, token[:8])
+	log.Printf("[coordinator] node registered: %s (%s) — token %s", req.Email, req.Hostname, shortID(token, 8))
 	jsonResp(w, RegisterResp{OK: true, NodeID: req.NodeID, Token: token, Message: "registered"})
 }
 
 // ── POST /api/heartbeat ──
 func (c *Coordinator) handleHeartbeat(w http.ResponseWriter, r *http.Request) {
+	r.Body = http.MaxBytesReader(w, r.Body, maxRequestBody)
 	var req HeartbeatReq
 	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
 		jsonError(w, "bad json", 400)
@@ -176,7 +197,7 @@ func (c *Coordinator) handleTaskRequest(w http.ResponseWriter, r *http.Request) 
 			if n, ok := c.nodes[token]; ok {
 				n.Status = "busy"
 			}
-			log.Printf("[coordinator] task %s assigned to node %s", task.ID[:8], token[:8])
+			log.Printf("[coordinator] task %s assigned to node %s", shortID(task.ID, 8), shortID(token, 8))
 			jsonResp(w, TaskResp{
 				OK:       true,
 				TaskID:   task.ID,
@@ -196,6 +217,7 @@ func (c *Coordinator) handleTaskRequest(w http.ResponseWriter, r *http.Request) 
 
 // ── POST /api/result ──
 func (c *Coordinator) handleSubmitResult(w http.ResponseWriter, r *http.Request) {
+	r.Body = http.MaxBytesReader(w, r.Body, maxRequestBody)
 	var req ResultSubmit
 	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
 		jsonError(w, "bad json", 400)
@@ -204,13 +226,19 @@ func (c *Coordinator) handleSubmitResult(w http.ResponseWriter, r *http.Request)
 
 	c.mu.Lock()
 	task, exists := c.tasks[req.TaskID]
+	// only the node the task was actually assigned to may complete it —
+	// otherwise any client that can guess a task ID can mark another node's
+	// work done and poison its counts
+	if !exists || req.Token == "" || task.Assigned != req.Token {
+		c.mu.Unlock()
+		jsonError(w, "unknown task or not assigned to this node", 403)
+		return
+	}
 	// only a pending/assigned task counts as a fresh completion — a duplicate
 	// or late submit for an already-done task must not double-count
-	fresh := exists && task.Status != "done"
-	if exists {
-		task.Status = "done"
-		task.Results = req.Results
-	}
+	fresh := task.Status != "done"
+	task.Status = "done"
+	task.Results = req.Results
 	if n, ok := c.nodes[req.Token]; ok {
 		n.Status = "idle"
 	}
@@ -226,7 +254,7 @@ func (c *Coordinator) handleSubmitResult(w http.ResponseWriter, r *http.Request)
 
 	if fresh {
 		log.Printf("[coordinator] task %s done: %d lines, %d hits, %.1fs",
-			req.TaskID[:8], req.Lines, req.Hits, req.Duration)
+			shortID(req.TaskID, 8), req.Lines, req.Hits, req.Duration)
 	}
 	jsonResp(w, ResultResp{OK: true, Message: "received"})
 }
@@ -423,7 +451,7 @@ func (c *Coordinator) monitorNodes() {
 			if time.Since(n.LastSeen) > time.Duration(c.config.HeartbeatInterval*3)*time.Second {
 				if n.Status != "dead" {
 					log.Printf("[coordinator] node %s (%s) marked DEAD — last seen %s ago",
-						n.Email, token[:8], time.Since(n.LastSeen).Round(time.Second))
+						n.Email, shortID(token, 8), time.Since(n.LastSeen).Round(time.Second))
 					n.Status = "dead"
 				}
 			}
@@ -436,11 +464,20 @@ func (c *Coordinator) monitorNodes() {
 func (c *Coordinator) syncToDrive() {
 	ticker := time.NewTicker(60 * time.Second)
 	for range ticker.C {
+		// Snapshot under the read lock. Once it is dropped a concurrent requeue or
+		// late submit can replace Task.Results while the staging loop below is still
+		// ranging over it, so copy the slice and its backing array here.
+		type doneSnapshot struct {
+			id      string
+			results []KeywordResult
+		}
 		c.mu.RLock()
-		doneTasks := []*Task{}
+		doneTasks := []doneSnapshot{}
 		for _, t := range c.tasks {
 			if t.Status == "done" {
-				doneTasks = append(doneTasks, t)
+				rs := make([]KeywordResult, len(t.Results))
+				copy(rs, t.Results)
+				doneTasks = append(doneTasks, doneSnapshot{id: t.ID, results: rs})
 			}
 		}
 		c.mu.RUnlock()
@@ -454,11 +491,11 @@ func (c *Coordinator) syncToDrive() {
 		os.MkdirAll(tmpDir, 0755)
 		staged := map[string]bool{}
 		for _, task := range doneTasks {
-			for _, kr := range task.Results {
+			for _, kr := range task.results {
 				if len(kr.Payloads) == 0 {
 					continue
 				}
-				fname := fmt.Sprintf("%s_%s.txt", sanitizeName(kr.Keyword), task.ID[:8])
+				fname := fmt.Sprintf("%s_%s.txt", sanitizeName(kr.Keyword), shortID(task.id, 8))
 				f, err := os.OpenFile(filepath.Join(tmpDir, fname),
 					os.O_CREATE|os.O_WRONLY|os.O_APPEND, 0644)
 				if err != nil {
@@ -470,8 +507,8 @@ func (c *Coordinator) syncToDrive() {
 				}
 				f.Close()
 			}
-			if len(task.Results) > 0 {
-				staged[task.ID] = true
+			if len(task.results) > 0 {
+				staged[task.id] = true
 			}
 		}
 
@@ -494,8 +531,8 @@ func (c *Coordinator) syncToDrive() {
 		// nothing to push); on failure keep staged tasks so no data is lost
 		c.mu.Lock()
 		for _, task := range doneTasks {
-			if syncOK || !staged[task.ID] {
-				delete(c.tasks, task.ID)
+			if syncOK || !staged[task.id] {
+				delete(c.tasks, task.id)
 			}
 		}
 		c.mu.Unlock()
@@ -507,6 +544,17 @@ func (c *Coordinator) syncToDrive() {
 func genToken() string {
 	n, _ := rand.Int(rand.Reader, big.NewInt(1<<62))
 	return fmt.Sprintf("%x", n.Int64())
+}
+
+// shortID returns the first n bytes of s, or all of s when it is shorter.
+// It replaces bare s[:n] at logging sites: Go panics when n > len(s), and the
+// ids and tokens applied to it are JSON strings (RegisterResp.Token,
+// TaskResp.TaskID) that arrive over HTTP and can be empty or short.
+func shortID(s string, n int) string {
+	if len(s) > n {
+		return s[:n]
+	}
+	return s
 }
 
 func jsonResp(w http.ResponseWriter, data interface{}) {

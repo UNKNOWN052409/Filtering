@@ -108,7 +108,7 @@ class OutputPool:
     def __init__(self, outdir, run_id, max_open=512, dedupe=False):
         self.outdir = outdir
         self.run_id = run_id
-        self.max_open = max_open
+        self.max_open = max(1, int(max_open))   # >=1, else the evict loop can't terminate
         self.dedupe = dedupe
         self.handles = OrderedDict()   # path -> file handle
         self.counts = {}              # sanitized name -> matched line count
@@ -127,13 +127,14 @@ class OutputPool:
         path = self._path_for(name)
         h = self.handles.get(path)
         if h is None:
-            h = open(path, 'ab')
-            self.handles[path] = h
-            if len(self.handles) > self.max_open:
+            # Evict BEFORE opening: the old order opened and inserted first, so
+            # max_open + 1 descriptors were live at the peak and the cap was
+            # never actually enforced.
+            while len(self.handles) >= self.max_open:
                 _, old = self.handles.popitem(last=False)
                 old.close()
-            else:
-                self.handles.move_to_end(path)
+            h = open(path, 'ab')
+            self.handles[path] = h
         else:
             self.handles.move_to_end(path)
         h.write(payload + b'\n')
@@ -159,6 +160,9 @@ def fmt_time(sec):
 
 
 def progress_bar(frac, width=22):
+    # clamp: bytes_done can overshoot total_bytes, and a negative repeat count
+    # raises ValueError
+    frac = max(0.0, min(1.0, float(frac)))
     filled = int(frac * width)
     return '[' + '#' * filled + '-' * (width - filled) + ']'
 
@@ -182,7 +186,6 @@ def render_stats(is_tty, bytes_done, total_bytes, lines, matched, per_kw,
 
 def run(input_path, keywords, auto_mode, outdir, dedupe, quiet):
     is_tty = sys.stderr.isatty() and not quiet
-    total_bytes = os.path.getsize(input_path)
     run_id = random.randint(10 ** (BIG_RAND_DIGITS - 1), 10 ** BIG_RAND_DIGITS - 1)
 
     os.makedirs(outdir, exist_ok=True)
@@ -198,7 +201,13 @@ def run(input_path, keywords, auto_mode, outdir, dedupe, quiet):
     t0 = start
     last_render = start
 
-    with open(input_path, 'rb') as f:
+    try:
+        f = open(input_path, 'rb')
+    except OSError as e:
+        sys.exit(f"[!] cannot open input: {input_path} ({e.strerror or e})")
+    with f:
+        # size from the open handle: getsize(path) before open() races the file
+        total_bytes = os.fstat(f.fileno()).st_size
         tail = b''
         first_line = True
         while True:

@@ -189,8 +189,8 @@ def classify_raw(raw):
         if EMAIL_RE.match(lp[0]):
             dom = lp[0].rsplit(b'@', 1)[1].lower()
             return "creds", raw, dom
-        if not re.search(rb"[a-zA-Z]", lp[0].strip()):
-            return "creds", raw, b''
+        # (the removed branch tested lp[0] for letters but returned exactly the
+        # same tuple as the fallthrough, so the test was dead code)
         return "creds", raw, b''
     # url or bare domain
     d = extract_domain(raw)
@@ -263,7 +263,6 @@ class OutputPool:
 
 def run(input_path, outdir, quiet):
     is_tty = sys.stderr.isatty() and not quiet
-    total_bytes = os.path.getsize(input_path)
     run_id = random.randint(10 ** 17, 10 ** 18 - 1)
     os.makedirs(outdir, exist_ok=True)
     pool = OutputPool(outdir, run_id)
@@ -283,6 +282,8 @@ def run(input_path, outdir, quiet):
 
     t0 = time.perf_counter()
     with open(input_path, 'rb') as f:
+        # size from the open handle: getsize(path) before open() races the file
+        total_bytes = os.fstat(f.fileno()).st_size
         tail = b''
         first_line = True
         while True:
@@ -408,14 +409,14 @@ def main():
 
     report = render_report(stats, pool, args.outdir, elapsed)
     rp = os.path.join(args.outdir, f"REPORT_{stats['run_id']}.txt")
-    with open(rp, "w") as f:
+    with open(rp, "w", encoding="utf-8") as f:   # non-ASCII service name
         f.write(report)
     print(report)
     print(f"[+] Report saved: {os.path.abspath(rp)}")
 
     if args.json:
         jp = os.path.join(args.outdir, f"REPORT_{stats['run_id']}.json")
-        with open(jp, "w") as f:
+        with open(jp, "w", encoding="utf-8") as f:
             json.dump(stats, f, indent=2)
         print(f"[+] JSON saved  : {os.path.abspath(jp)}")
 

@@ -131,9 +131,17 @@ func bigRand18() string {
 	return fmt.Sprintf("%d", n.Int64()+100000000000000000)
 }
 
-func Run(inputPath string, keywords []string, outDir string, done chan struct{}) *Stats {
+// Run streams inputPath, writing per-keyword hits into outDir, and returns the
+// accumulated Stats. done is closed exactly once, by the deferred close below
+// — callers must never close it themselves. onStart is optional; when supplied
+// it receives the live *Stats as soon as it is allocated, so a caller can
+// render progress mid-run without racing on the returned pointer.
+func Run(inputPath string, keywords []string, outDir string, done chan struct{}, onStart ...func(*Stats)) *Stats {
 	stats := &Stats{KwHits: make([]atomic.Int64, len(keywords))}
 	defer close(done)
+	if len(onStart) > 0 && onStart[0] != nil {
+		onStart[0](stats)
+	}
 
 	kwLower := make([]string, len(keywords))
 	kwSanitized := make([]string, len(keywords))
@@ -144,10 +152,19 @@ func Run(inputPath string, keywords []string, outDir string, done chan struct{})
 
 	runID := bigRand18()
 	files := make(map[string]*fileEntry)
+	var openErrs []string
 
 	defer func() {
 		for _, fe := range files {
 			fe.handle.Close()
+		}
+		// a keyword file we could not open is a run-level failure: report it once
+		// here instead of silently dropping every hit for that keyword
+		if len(openErrs) > 0 {
+			fmt.Fprintf(os.Stderr, "Error opening %d output file(s):\n", len(openErrs))
+			for _, e := range openErrs {
+				fmt.Fprintf(os.Stderr, "  %s\n", e)
+			}
 		}
 	}()
 
@@ -158,6 +175,7 @@ func Run(inputPath string, keywords []string, outDir string, done chan struct{})
 		p := filepath.Join(outDir, name+"_"+runID+".txt")
 		f, err := os.OpenFile(p, os.O_CREATE|os.O_WRONLY|os.O_APPEND, 0644)
 		if err != nil {
+			openErrs = append(openErrs, fmt.Sprintf("%s: %v", p, err))
 			return nil
 		}
 		fe := &fileEntry{handle: f}
@@ -167,8 +185,9 @@ func Run(inputPath string, keywords []string, outDir string, done chan struct{})
 
 	f, err := os.Open(inputPath)
 	if err != nil {
+		// done is closed by the deferred close above — closing it here too would
+		// panic with "close of closed channel"
 		fmt.Fprintf(os.Stderr, "Error opening input: %v\n", err)
-		close(done)
 		return stats
 	}
 	defer f.Close()
@@ -178,6 +197,12 @@ func Run(inputPath string, keywords []string, outDir string, done chan struct{})
 
 	for {
 		line, err := reader.ReadBytes('\n')
+		if err != nil && err != io.EOF {
+			// a real read failure is terminal: continuing would spin the loop
+			// forever and inflate the empty/lines counters with zero-length reads
+			fmt.Fprintf(os.Stderr, "Error reading %s: %v\n", inputPath, err)
+			break
+		}
 		trimmed := line
 
 		if len(trimmed) > 0 && trimmed[len(trimmed)-1] == '\n' {
@@ -236,10 +261,17 @@ func parseLine(line []byte, kwLower, kwSanitized []string, stats *Stats, getFile
 
 	for i, kw := range kwLower {
 		if domainMatches(domain, kw) {
-			if fe := getFile(kwSanitized[i]); fe != nil {
-				fmt.Fprintln(fe.handle, payload)
-				fe.lines++
-			}
+			// a hit is only a hit once it actually reached the output file; a
+			// failed open or write is surfaced as a run-level error instead
+			fe := getFile(kwSanitized[i])
+			if fe == nil {
+				continue
+				}
+			if _, werr := fmt.Fprintln(fe.handle, payload); werr != nil {
+				fmt.Fprintf(os.Stderr, "Error writing hit for %s: %v\n", kw, werr)
+				continue
+				}
+			fe.lines++
 			stats.KwHits[i].Add(1)
 			hit = true
 		}
